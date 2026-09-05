@@ -3,7 +3,7 @@ use liq_core::{
     CandidateIndex, OracleTriggerPath, ProfitConfig, ProfitabilityCalculator, PriceFx, Pubkey,
     UpdateSource,
 };
-use liq_execution::{ExecConfig, ExecutionEngine, PreparedTx};
+use liq_execution::{BidProfile, ExecConfig, ExecutionEngine, PreparedTx};
 use liq_risk::{CircuitBreaker, RiskLimits};
 use liq_telemetry::Metrics;
 use serde::Deserialize;
@@ -84,6 +84,7 @@ async fn main() -> anyhow::Result<()> {
             dry_run: dry,
             rpc_url: cfg.rpc_url.clone(),
             jito_block_engine_url: cfg.jito_block_engine_url.clone(),
+            bid_profile: BidProfile::Balanced,
         },
         risk,
         metrics.clone(),

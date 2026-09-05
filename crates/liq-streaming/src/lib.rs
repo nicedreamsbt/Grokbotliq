@@ -1,4 +1,13 @@
-//! Geyser subscriber trait + mock provider for tests.
+//! Geyser subscriber trait, mock provider, multi-provider freshness failover,
+//! fixture loading, and Yellowstone integration stubs (compile without live gRPC creds).
+
+mod failover;
+mod fixtures;
+mod yellowstone;
+
+pub use failover::*;
+pub use fixtures::*;
+pub use yellowstone::*;
 
 use async_trait::async_trait;
 use liq_core::{Pubkey, UpdateSource};
@@ -28,7 +37,7 @@ pub struct SlotUpdate {
 pub enum StreamEvent {
     Account(AccountUpdate),
     Slot(SlotUpdate),
-    /// Oracle-ish account shortcut used by mock tests.
+    /// Oracle-ish account shortcut used by mock / fixture tests.
     Price {
         asset: Pubkey,
         price_fx: u128,
@@ -45,6 +54,10 @@ pub enum StreamError {
     Subscribe(String),
     #[error("channel closed")]
     ChannelClosed,
+    #[error("stale: {0}")]
+    Stale(String),
+    #[error("fixture: {0}")]
+    Fixture(String),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -55,6 +68,10 @@ pub struct SubscribeFilter {
 
 #[async_trait]
 pub trait GeyserSubscriber: Send + Sync {
+    fn name(&self) -> &str {
+        "unnamed"
+    }
+
     async fn subscribe(
         &self,
         filter: SubscribeFilter,
@@ -63,17 +80,32 @@ pub trait GeyserSubscriber: Send + Sync {
 
 /// In-memory mock that replays a preloaded event sequence.
 pub struct MockGeyser {
+    name: String,
     events: Vec<StreamEvent>,
 }
 
 impl MockGeyser {
     pub fn new(events: Vec<StreamEvent>) -> Self {
-        Self { events }
+        Self {
+            name: "mock".into(),
+            events,
+        }
+    }
+
+    pub fn named(name: impl Into<String>, events: Vec<StreamEvent>) -> Self {
+        Self {
+            name: name.into(),
+            events,
+        }
     }
 }
 
 #[async_trait]
 impl GeyserSubscriber for MockGeyser {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
     async fn subscribe(
         &self,
         _filter: SubscribeFilter,

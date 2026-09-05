@@ -7,4 +7,8 @@ services:
       - ../config/example.env
     environment:
       DRY_RUN: "true"
+      LIQ_CONFIG: /config/example.toml
+      LIQ_FIXTURES: /fixtures
     restart: unless-stopped
+    # Uncomment to run shadow against fixtures instead:
+    # command: ["shadow", "/fixtures"]

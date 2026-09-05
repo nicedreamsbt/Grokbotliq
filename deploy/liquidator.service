@@ -8,12 +8,15 @@ Type=simple
 User=liq
 WorkingDirectory=/opt/grokbotliq
 EnvironmentFile=/opt/grokbotliq/config/local.env
+# Safety: keep DRY_RUN=true in local.env until credentials are validated.
 ExecStart=/opt/grokbotliq/target/release/liquidator
 Restart=on-failure
 RestartSec=3
 LimitNOFILE=65536
 # Do not commit key material; mount secrets separately.
 # Environment=KEYPAIR_PATH=/run/secrets/liquidator.json
+# Alternate: shadow / replay for dry evaluation
+# ExecStart=/opt/grokbotliq/target/release/shadow /opt/grokbotliq/fixtures
 
 [Install]
 WantedBy=multi-user.target

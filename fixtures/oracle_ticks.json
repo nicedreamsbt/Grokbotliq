@@ -1,0 +1,53 @@
+{
+  "description": "Sample oracle price ticks that cross HOT borrower triggers",
+  "ticks": [
+    {
+      "asset": { "tag": 2, "index": 1 },
+      "label": "SOL",
+      "price_usd": 120.0,
+      "slot": 100,
+      "write_version": 1,
+      "note": "bootstrap above trigger"
+    },
+    {
+      "asset": { "tag": 2, "index": 1 },
+      "label": "SOL",
+      "price_usd": 95.0,
+      "slot": 101,
+      "write_version": 2,
+      "note": "crosses collateral-down trigger at 100"
+    },
+    {
+      "asset": { "tag": 2, "index": 2 },
+      "label": "stETH",
+      "price_usd": 1.0,
+      "slot": 102,
+      "write_version": 1,
+      "note": "debt asset bootstrap"
+    },
+    {
+      "asset": { "tag": 2, "index": 2 },
+      "label": "stETH",
+      "price_usd": 1.05,
+      "slot": 103,
+      "write_version": 2,
+      "note": "crosses debt-up trigger at 1.02"
+    },
+    {
+      "asset": { "tag": 2, "index": 3 },
+      "label": "BONK",
+      "price_usd": 0.000025,
+      "slot": 104,
+      "write_version": 1,
+      "note": "Save market collateral bootstrap"
+    },
+    {
+      "asset": { "tag": 2, "index": 3 },
+      "label": "BONK",
+      "price_usd": 0.000018,
+      "slot": 105,
+      "write_version": 2,
+      "note": "crosses Save collateral-down at 0.00002"
+    }
+  ]
+}

@@ -57,7 +57,7 @@ Price-trigger indexes: for each asset mint, a `BTreeMap<OrderedPrice, Vec<Accoun
 | Crate | Responsibility |
 |-------|----------------|
 | `liq-core` | StateStore, CandidateIndex, profitability, types, health traits |
-| `liq-streaming` | Geyser subscriber trait + mock provider |
+| `liq-streaming` | Geyser trait, mock, freshness failover, Yellowstone stubs, fixtures |
 | `liq-kamino` | Klend health math + ix layout helpers |
 | `liq-project0` | Classic + receivership builders / health |
 | `liq-save` | Save/Solend health + liquidate ix encoding |
@@ -81,6 +81,6 @@ See `config/example.toml` and `config/example.env`. **DRY_RUN=true** by default.
 
 ## Non-goals (this phase)
 
-- Live Geyser connection (trait + mock only)
+- Live Yellowstone gRPC client (stubs + failover compile without creds)
 - Full IDL-accurate zero-copy account decode
 - Production Jito auth

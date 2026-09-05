@@ -2,6 +2,21 @@
 
 Research date: 2026-09-05 (America/Phoenix). Sources: official GitHub READMEs, kamino.com docs, docs.0.xyz, docs.save.finance. No private credentials used.
 
+## IDL pins (vendored)
+
+| Protocol | Path | Version / pin | sha256 |
+|----------|------|---------------|--------|
+| Kamino klend full IDL | `crates/liq-kamino/idls/klend.json` | IDL `version` **1.25.0** via `@kamino-finance/klend-sdk@11.0.1` | `2a7e311eb33ffd79241e7cb8424e2170fb487a6ba678a115ce3d9a561375670d` |
+| Kamino liquidation subset | `crates/liq-kamino/idls/klend_liquidation_subset.json` | same SDK pin; discriminators only | `288292e4e5b6a65f8a13eb83531225eff7a096bcf182b9722ec72ad7710efd20` |
+| Project 0 / marginfi subset | `crates/liq-project0/idls/marginfi_liquidation_subset.json` | extracted 2026-09-05 from `0dotxyz/marginfi-v2` type-crate | `ce9b34af57c252784a2553fcb9dda3968406b5e3d52d80176d59148847408dfb` |
+| Project 0 discriminators (Rust) | `crates/liq-project0/idls/discriminators.rs` | mirror of type-crate constants | — |
+| Project 0 FeeState layout | `crates/liq-project0/idls/fee_state.rs` | type-crate `FeeState` | — |
+| Project 0 type constants excerpt | `crates/liq-project0/idls/type_constants_excerpt.rs` | type-crate constants | — |
+| Save / Solend ix tags | `crates/liq-save/idls/save_lending_ix.json` | pinned 2026-09-05; SPL token-lending enum | `a5ed2421818fdfed5bdf7ec76223ff5718e46ff2bc43b9418753d821d90e72de` |
+| Save solend-sdk instruction source | `crates/liq-save/idls/solend_sdk_0.1.0_instruction.rs` | **solend-sdk 0.1.0** vendored excerpt | — |
+
+Discriminator smoke tests live in `liq-kamino`, `liq-project0`, and `liq-save` unit tests.
+
 ## 1. Kamino Lending (klend)
 
 ### Program IDs (verified)
@@ -16,18 +31,20 @@ Research date: 2026-09-05 (America/Phoenix). Sources: official GitHub READMEs, k
 
 Sources: Kamino-Finance/klend README; kamino.com program-addresses.
 
-Related: klend, klend-sdk, terminator, kbots-rust-public, scope, scope-sdk.
-
 ### Math / ordering
 
 - Liquidatable when borrowed > sum(deposit * liq_threshold)
-- Ix: liquidate_obligation_and_redeem_reserve_collateral_v2
-- Order: ComputeBudget -> refresh reserves/obligation -> liquidate v2
-- Bonus ~5-10%; Scope oracle 512 slots
+- Ix: `liquidate_obligation_and_redeem_reserve_collateral_v2`
+- Order: ComputeBudget → refresh reserves/obligation → liquidate v2
+- Bonus ~5–10%; Scope oracle max age **512 slots** (`SCOPE_MAX_AGE_SLOTS`)
 
-### TODOs
+### Discriminators (pinned)
 
-- IDL discriminators; live close-factor/bonus; borsh layouts
+| Ix | Bytes |
+|----|-------|
+| refreshReserve | `[2, 218, 138, 235, 79, 201, 25, 102]` |
+| refreshObligation | `[33, 132, 147, 228, 151, 192, 72, 89]` |
+| liquidateObligationAndRedeemReserveCollateralV2 | `[162, 161, 35, 143, 30, 187, 185, 103]` |
 
 ## 2. Project 0
 
@@ -36,29 +53,38 @@ Related: klend, klend-sdk, terminator, kbots-rust-public, scope, scope-sdk.
 | Mainnet | `MFv2hWf31Z9kbCa1snEPYctwafyhdvnV7FZnsebVacA` |
 | Staging | `stag8sTKds2h4KzjUw3zKTsxbqvT4XKHdaR9X9E6Rct` |
 
-Sources: docs.0.xyz program-addresses.
+Sources: docs.0.xyz program-addresses; `0dotxyz/marginfi-v2`.
 
-- Maint health < 0 => liquidatable
-- Classic ~2.5%+2.5%; receivership start/end, max fee ~10% (FeeState)
-- TODOs: IDL discriminators, FeeState PDA, group pubkey
+- Maint health < 0 ⇒ liquidatable
+- Classic ~2.5% + 2.5%; receivership start/end; max fee ~10% (`FeeState`)
+- Seeds: `feestate`, `liq_record`
+- Classic liquidate Anchor sighash: `[214, 169, 151, 213, 251, 167, 86, 219]`
 
 ## 3. Save Finance
 
 - Program: `So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo`
 - Source: docs.save.finance/architecture/addresses.md
-- LiquidateObligation; close factor classic 50%; RefreshReserve -> RefreshObligation -> Liquidate
+- Tags: RefreshReserve=3, RefreshObligation=7, LiquidateObligation=12, LiquidateAndRedeem=17
+- Close factor classic 50% (`DEFAULT_CLOSE_FACTOR_BPS = 5000`)
+- Order: RefreshReserve* → RefreshObligation → LiquidateObligationAndRedeemReserveCollateral
 - Upgrade authority: `2Fwvr3MKhHhqakgjjEWcpWZZabbRCetHjukHi1zfKxjk`
 - Market owner: `5pHk2TmnqQzRF9L6egy5FfiyBgS7G9cMZ5RFaJAvghzw`
 - Fee receiver: `9RuqAN42PTUi9ya59k9suGATrkqzvb9gk2QABJtQzGP5`
 - SLND mint: `SLNDpmoWTVADgEdndyvWzroNL7zSi1dF9PC3xHGtPwp`
 
-## 4. Needs live credentials
+## 4. Streaming / Yellowstone
 
-1. Geyser gRPC + auth
-2. Private RPC
-3. Jito block engine
-4. Keypair + ATAs
-5. Live market/bank/reserve pubkeys
-6. IDL pin
-7. FeeState fields
-8. Per-asset params
+- Trait + mock + **multi-provider freshness failover** in `liq-streaming`
+- Yellowstone integration points: `YellowstoneConfig` / `YellowstoneSubscriber` (stub; compiles without gRPC creds)
+- Env: `GEYSER_ENDPOINT`, `GEYSER_X_TOKEN`, optional `GEYSER_COMMITMENT`, `GEYSER_PING_MS`
+
+## 5. Needs live credentials (still)
+
+1. Geyser / Yellowstone gRPC endpoint + auth token
+2. Private RPC URL
+3. Jito block engine URL (+ auth UUID if required)
+4. Funded liquidator keypair + ATAs (never commit)
+5. Live market / bank / reserve pubkeys per protocol
+6. Optional: re-pin IDLs when upstream releases
+7. Live FeeState account for receivership max fee
+8. Per-asset liq threshold / bonus / close-factor confirmation on-chain

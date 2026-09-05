@@ -1,0 +1,68 @@
+{
+  "description": "Borrower snapshots near liquidation with price triggers",
+  "borrowers": [
+    {
+      "account": { "tag": 1, "index": 1 },
+      "protocol": "Kamino",
+      "band": "Hot",
+      "health": 1.04,
+      "assets": [{ "tag": 2, "index": 1 }],
+      "triggers": [
+        {
+          "asset": { "tag": 2, "index": 1 },
+          "side": "CollateralDown",
+          "trigger_price_usd": 100.0
+        }
+      ],
+      "plan": {
+        "ix_order": "kamino",
+        "repay_amount": 500000000,
+        "gross_profit_usd": 2.5,
+        "notional_usd": 500.0,
+        "capital_usd": 500.0
+      }
+    },
+    {
+      "account": { "tag": 1, "index": 2 },
+      "protocol": "Project0",
+      "band": "Hot",
+      "health": 1.02,
+      "assets": [{ "tag": 2, "index": 2 }],
+      "triggers": [
+        {
+          "asset": { "tag": 2, "index": 2 },
+          "side": "DebtUp",
+          "trigger_price_usd": 1.02
+        }
+      ],
+      "plan": {
+        "ix_order": "project0_classic",
+        "repay_amount": 1000000,
+        "gross_profit_usd": 1.2,
+        "notional_usd": 80.0,
+        "capital_usd": 80.0
+      }
+    },
+    {
+      "account": { "tag": 1, "index": 3 },
+      "protocol": "Save",
+      "band": "Critical",
+      "health": 0.98,
+      "assets": [{ "tag": 2, "index": 3 }],
+      "triggers": [
+        {
+          "asset": { "tag": 2, "index": 3 },
+          "side": "CollateralDown",
+          "trigger_price_usd": 0.00002
+        }
+      ],
+      "plan": {
+        "ix_order": "save",
+        "repay_amount": 25000000,
+        "gross_profit_usd": 3.0,
+        "notional_usd": 200.0,
+        "capital_usd": 200.0
+      }
+    }
+  ]
+}

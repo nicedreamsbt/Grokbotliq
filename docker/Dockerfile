@@ -8,7 +8,11 @@ RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/
 COPY --from=build /app/target/release/liquidator /usr/local/bin/
 COPY --from=build /app/target/release/shadow /usr/local/bin/
 COPY --from=build /app/target/release/replay /usr/local/bin/
+COPY --from=build /app/target/release/bench /usr/local/bin/
 COPY --from=build /app/config /config
+COPY --from=build /app/fixtures /fixtures
 ENV LIQ_CONFIG=/config/example.toml
+ENV LIQ_FIXTURES=/fixtures
 ENV DRY_RUN=true
+WORKDIR /app
 CMD ["liquidator"]

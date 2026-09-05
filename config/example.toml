@@ -1,4 +1,4 @@
-# Grokbotliq example config — safe defaults
+# Grokbotliq example config — safe defaults (no secrets)
 dry_run = true
 rpc_url = "https://YOUR_PRIVATE_RPC"
 # geyser_endpoint = "https://YOUR_GEYSER_GRPC"
@@ -13,3 +13,6 @@ oracle_max_staleness_slots = 30
 kamino = true
 project0 = true
 save = true
+
+# Optional: fixtures dir for shadow/replay when not passed on CLI
+# fixtures_dir = "fixtures"
