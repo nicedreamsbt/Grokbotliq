@@ -242,6 +242,8 @@ async fn main() -> anyhow::Result<()> {
             notional_usd_micro: opp.notional_usd_micro,
             expected_profit_usd_micro: opp.expected_profit_usd_micro,
             wire: vec![],
+            instructions: vec![],
+            funding_strategy: None,
             ixs: opp.plan_ixs.clone(),
         };
         let res = exec.execute(&tx, 0).await?;

@@ -9,11 +9,12 @@ Stream-first Solana liquidation bot. Design target: sub-slot reaction from oracl
 3. **Precompute** — keep partially built transactions (account metas, LUTs, refresh ixs) warm for HOT/CRITICAL candidates.
 4. **Profit gates before submit** — configurable min USD profit, min ROI, gas/tip budget, inventory constraints.
 5. **Circuit breakers** — halt on oracle staleness, error storms, inventory breach, or global pause signals.
+6. **FundingStrategy selection** — evaluate Inventory / flash / receivership paths; pick max EV among feasible Accept decisions.
 
 ## Pipeline
 
 ```
-Geyser / Yellowstone gRPC
+Geyser / Yellowstone gRPC  (or fixtures / MockGeyser)
         |
         v
 +------------------+
@@ -32,14 +33,46 @@ Geyser / Yellowstone gRPC
 Oracle price update ----> trigger crossing scan ----> local health recompute
         |
         v
-ProfitabilityCalculator + RiskLimits
+FundingPathEnumerator  (Inventory | SaveFlash | KaminoFlash | P0Receivership)
+        |
+        +-- swap cost (SwapRouter) + flash fee + tip modeled
+        +-- score ≈ net_profit × landing_prob / latency  (ROI via capital gate)
         |
         v
-Precomputed Tx builder (refresh + liquidate + optional swap)
+Protocol-exact Tx builder (CU + refresh + liquidate [+ flash wrap] [+ swap])
         |
         v
-Execution (Jito bundle / TPU / RPC send) + Telemetry
+Execution (DRY_RUN log | Jito bundle / TPU / RPC send) + Telemetry
 ```
+
+## FundingStrategy
+
+```
+                    +------------------+
+                    | Liquidatable hit |
+                    +--------+---------+
+                             |
+         +-------------------+-------------------+
+         |                   |                   |
+         v                   v                   v
+   +-----------+      +-------------+     +------------------+
+   | Inventory |      | SaveFlash / |     | P0 Receivership  |
+   |  wallet   |      | KaminoFlash |     | start→wd→rp→end  |
+   +-----+-----+      +------+------+     +--------+---------+
+         |                   |                     |
+         +---------+---------+---------------------+
+                   |
+                   v
+         pick max expected_value_score
+         among ProfitDecision::Accept
+```
+
+| Strategy | Capital | Flash fee | Typical latency weight |
+|----------|---------|-----------|------------------------|
+| Inventory | Face notional | 0 | lowest |
+| SaveFlashLoan | ~0 (flash) | reserve fee (bps) | higher |
+| KaminoFlashBorrow | ~0 (flash) | reserve fee | higher |
+| Project0Receivership | collateral-first | 0 (avoids flash) | highest (more ixs) |
 
 ## Candidate bands
 
@@ -50,19 +83,17 @@ Execution (Jito bundle / TPU / RPC send) + Telemetry
 | WARM | Elevated risk but not near trigger | Recompute on large price moves / periodic |
 | COLD | Healthy with wide buffer | Lazy / batch refresh |
 
-Price-trigger indexes: for each asset mint, a `BTreeMap<OrderedPrice, Vec<AccountId>>` stores the price level at which the account would cross into liquidatable territory (holding other prices fixed). On oracle update for mint M at price P, scan all triggers with key <= P (or >= P depending on exposure side).
-
 ## Crates
 
 | Crate | Responsibility |
 |-------|----------------|
-| `liq-core` | StateStore, CandidateIndex, profitability, types, health traits |
-| `liq-streaming` | Geyser trait, mock, freshness failover, Yellowstone stubs, fixtures |
-| `liq-kamino` | Klend health math + ix layout helpers |
-| `liq-project0` | Classic + receivership builders / health |
-| `liq-save` | Save/Solend health + liquidate ix encoding |
-| `liq-execution` | Tx submit (dry-run, RPC, Jito placeholder) |
-| `liq-routing` | Swap route quotes (stub + trait) |
+| `liq-core` | StateStore, CandidateIndex, profitability, FundingStrategy, Instruction |
+| `liq-streaming` | Geyser trait, mock, failover, Yellowstone stubs, fixtures, RPC bootstrap |
+| `liq-kamino` | Klend health + flash + tx_builder |
+| `liq-project0` | Classic + receivership wire builders |
+| `liq-save` | Save health + flash atomic plan |
+| `liq-execution` | Tx submit + opportunity JSON |
+| `liq-routing` | SwapRouter + route cache |
 | `liq-risk` | Limits + circuit breaker |
 | `liq-telemetry` | Prometheus-compatible metric types |
 
@@ -70,7 +101,7 @@ Price-trigger indexes: for each asset mint, a `BTreeMap<OrderedPrice, Vec<Accoun
 
 | Bin | Role |
 |-----|------|
-| `liquidator` | Live / dry-run bot |
+| `liquidator` | Bootstrap → stream → funding plans → dry-run / submit |
 | `shadow` | Observe + log would-be liquidations without submit |
 | `replay` | Replay recorded Geyser fixtures through the pipeline |
 | `bench` | Microbench index / health / profitability |
@@ -79,8 +110,9 @@ Price-trigger indexes: for each asset mint, a `BTreeMap<OrderedPrice, Vec<Accoun
 
 See `config/example.toml` and `config/example.env`. **DRY_RUN=true** by default.
 
-## Non-goals (this phase)
+## Remaining gaps (honest)
 
-- Live Yellowstone gRPC client (stubs + failover compile without creds)
+- Live Yellowstone gRPC client (trait + stub compile without creds)
 - Full IDL-accurate zero-copy account decode
-- Production Jito auth
+- Production Jito auth + VersionedTransaction signing
+- Live reserve flash-fee reads; re-verify Save tags 19/20 and Kamino flash discs on mainnet

@@ -64,13 +64,64 @@ Sources: docs.0.xyz program-addresses; `0dotxyz/marginfi-v2`.
 
 - Program: `So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo`
 - Source: docs.save.finance/architecture/addresses.md
-- Tags: RefreshReserve=3, RefreshObligation=7, LiquidateObligation=12, LiquidateAndRedeem=17
+- Tags: RefreshReserve=3, RefreshObligation=7, LiquidateObligation=12, FlashLoan=13 (legacy), LiquidateAndRedeem=17, FlashBorrow=19, FlashRepay=20
 - Close factor classic 50% (`DEFAULT_CLOSE_FACTOR_BPS = 5000`)
 - Order: RefreshReserve* → RefreshObligation → LiquidateObligationAndRedeemReserveCollateral
 - Upgrade authority: `2Fwvr3MKhHhqakgjjEWcpWZZabbRCetHjukHi1zfKxjk`
 - Market owner: `5pHk2TmnqQzRF9L6egy5FfiyBgS7G9cMZ5RFaJAvghzw`
 - Fee receiver: `9RuqAN42PTUi9ya59k9suGATrkqzvb9gk2QABJtQzGP5`
 - SLND mint: `SLNDpmoWTVADgEdndyvWzroNL7zSi1dF9PC3xHGtPwp`
+
+
+## Flash loans / atomic funding
+
+### Save / Solend
+
+Vendored source: `crates/liq-save/idls/solend_sdk_0.1.0_instruction.rs`.
+
+| Tag | Instruction | Data layout |
+|-----|-------------|-------------|
+| **13** | `FlashLoan` (legacy / deprecated CPI-receiver) | `u8 tag` + `u64 amount` |
+| **19** | `FlashBorrowReserveLiquidity` (**preferred**) | `u8 tag` + `u64 liquidity_amount` |
+| **20** | `FlashRepayReserveLiquidity` | `u8 tag` + `u64 liquidity_amount` + `u8 borrow_instruction_index` |
+
+**Preferred atomic composition** (implemented in `liq-save::flash`):
+
+1. ComputeBudget (limit + price)
+2. RefreshReserve* (all touched reserves)
+3. RefreshObligation
+4. **FlashBorrowReserveLiquidity** (record ix index)
+5. LiquidateObligationAndRedeemReserveCollateral
+6. Optional swap (SwapRouter)
+7. **FlashRepayReserveLiquidity** (same amount + borrow index)
+
+FlashBorrow accounts (7): source_liquidity(mut), destination_liquidity(mut), reserve(mut), lending_market, lending_market_authority, instructions sysvar, token_program.
+
+FlashRepay accounts (9): source(mut), destination(mut), fee_receiver(mut), host_fee_receiver(mut), reserve(mut), lending_market, user_transfer_authority(signer), instructions sysvar, token_program.
+
+**Verification TODO:** Confirm Save mainnet program still packs tags 19/20 identically before live submit. Default modeled flash fee: 9 bps (`DEFAULT_FLASH_FEE_BPS`) until reserve `flash_loan_fee_wad` is read on-chain.
+
+### Kamino (klend)
+
+IDL (`klend.json`) includes `flashBorrowReserveLiquidity` / `flashRepayReserveLiquidity`.  
+Discriminators (Anchor `sha256("global:<snake>")[0..8]`, same method as pinned refresh/liq):
+
+| Ix | Bytes |
+|----|-------|
+| flash_borrow_reserve_liquidity | `[135, 231, 52, 167, 7, 52, 212, 193]` |
+| flash_repay_reserve_liquidity | `[185, 117, 0, 203, 96, 245, 180, 186]` |
+
+Args: borrow `{ liquidityAmount: u64 }`; repay `{ liquidityAmount: u64, borrowInstructionIndex: u8 }`.
+
+**Verification TODO:** Re-pin against `@kamino-finance/klend-sdk` codegen JS (IDL JSON pin lacks discriminator arrays). `KAMINO_FLASH_SUPPORTED = true` in code; inventory + post-liq swap remains available if flash is disabled at runtime.
+
+### Project 0 receivership (flash alternative)
+
+Receivership is a first-class `FundingStrategy::Project0Receivership` that can avoid flash:
+
+`ComputeBudget → start_liquidation → withdraw → [swap] → repay → end_liquidation`
+
+Wire builders in `liq-project0::tx_builder` emit real `Instruction` lists (program_id, account metas, data bytes). Upstream also exposes `START_FLASHLOAN` / `END_FLASHLOAN` discriminators for marginfi flash loans (not required for receivership path).
 
 ## 4. Streaming / Yellowstone
 
@@ -88,3 +139,5 @@ Sources: docs.0.xyz program-addresses; `0dotxyz/marginfi-v2`.
 6. Optional: re-pin IDLs when upstream releases
 7. Live FeeState account for receivership max fee
 8. Per-asset liq threshold / bonus / close-factor confirmation on-chain
+9. Flash fee / tag verification (Save 19/20; Kamino flash discs vs SDK codegen)
+10. Live getProgramAccounts bootstrap + Yellowstone account-update decode

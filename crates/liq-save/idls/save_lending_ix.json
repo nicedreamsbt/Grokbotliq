@@ -12,7 +12,10 @@
     "RefreshReserve": 3,
     "RefreshObligation": 7,
     "LiquidateObligation": 12,
-    "LiquidateObligationAndRedeemReserveCollateral": 17
+    "LiquidateObligationAndRedeemReserveCollateral": 17,
+    "FlashLoan": 13,
+    "FlashBorrowReserveLiquidity": 19,
+    "FlashRepayReserveLiquidity": 20
   },
   "ordering": [
     "RefreshReserve*",
@@ -33,5 +36,15 @@
     "user_transfer_authority(signer)",
     "clock",
     "token_program"
-  ]
+  ],
+  "flash_atomic_ordering": [
+    "ComputeBudget",
+    "RefreshReserve*",
+    "RefreshObligation",
+    "FlashBorrowReserveLiquidity",
+    "LiquidateObligationAndRedeemReserveCollateral",
+    "SwapOptional",
+    "FlashRepayReserveLiquidity"
+  ],
+  "note_flash": "Tags 19/20 from solend-sdk 0.1.0 pack; verify on Save mainnet before live."
 }

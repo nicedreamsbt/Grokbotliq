@@ -9,6 +9,7 @@ liq-core = { workspace = true }
 serde = { workspace = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
+parking_lot = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

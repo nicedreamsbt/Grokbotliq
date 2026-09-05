@@ -1,15 +1,29 @@
 # Grokbotliq
 
-Production-oriented Solana multi-protocol liquidation bot (Kamino / Project 0 / Save).
+Solana multi-protocol liquidation bot (Kamino / Project 0 / Save).
 
-**Status:** Phases 1–8 foundations. Core engine, adapters, execution path, fixtures, shadow/replay/bench. **`DRY_RUN=true` by default.** No secrets in repo.
+**Status:** Beyond pure scaffold — funding path selection, protocol-exact instruction builders, flash/atomic compositions, and an ingestion→plan loop are wired. **Still not production-ready:** live Yellowstone gRPC client, live RPC decode, signing, and Jito auth are stubs. **`DRY_RUN=true` by default.** No secrets in repo.
+
+## What's wired vs not
+
+| Area | Wired | Not yet |
+|------|-------|---------|
+| FundingStrategy enum + EV path pick | Inventory / SaveFlash / KaminoFlash / P0Receivership | Live inventory balances / reserve fee reads |
+| Save flash atomic plan | FlashBorrow(19) → liq → FlashRepay(20) + tests | Mainnet fee/tag re-verify (TODO in PROTOCOL_RESEARCH) |
+| Kamino flash | IDL-backed borrow/repay + Anchor discriminators | SDK codegen disc re-pin before mainnet |
+| P0 receivership | Full wire `Instruction` sequence (start→withdraw→repay→end) | Live bank/oracle remaining accounts |
+| Tx builders | Non-empty data bytes + explicit account metas | VersionedTransaction sign + LUT fill |
+| State ingestion | Fixture bootstrap + StateStore apply; JSON-RPC request shapes | reqwest/Yellowstone live clients |
+| liquidator binary | Loop: bootstrap → fixture stream → funding plans → DRY_RUN JSON | Continuous live Geyser without fixtures |
+| Routing | SwapRouter + Jupiter placeholder + DirectDex + HOT route cache | Real Jupiter/DEX quote HTTP |
+| Jito / submit | Traits + dry-run engine | Live block-engine auth |
 
 ## Docs
 
 | Doc | Contents |
 |-----|----------|
-| [PROTOCOL_RESEARCH.md](./PROTOCOL_RESEARCH.md) | Program IDs, math, **IDL pin paths/versions** |
-| [ARCHITECTURE.md](./ARCHITECTURE.md) | Stream-first pipeline |
+| [PROTOCOL_RESEARCH.md](./PROTOCOL_RESEARCH.md) | Program IDs, math, IDL pins, **flash loan layouts** |
+| [ARCHITECTURE.md](./ARCHITECTURE.md) | Pipeline + **FundingStrategy** diagram |
 | [BENCHMARKS.md](./BENCHMARKS.md) | Local microbench numbers |
 | [fixtures/README.md](./fixtures/README.md) | Oracle + borrower JSON fixtures |
 
@@ -17,20 +31,17 @@ Production-oriented Solana multi-protocol liquidation bot (Kamino / Project 0 / 
 
 ```
 crates/
-  liq-core          state store, candidate bands, price-trigger index, profitability
-  liq-streaming     Geyser trait, mock, freshness failover, Yellowstone stubs, fixtures
-  liq-kamino        klend health + liquidate v2 helpers (+ idls/)
-  liq-project0      classic + receivership (+ idls/)
-  liq-save          Save/Solend health + LiquidateObligation (+ idls/)
-  liq-execution     dry-run / submit placeholders (RPC + Jito)
-  liq-routing       swap quote trait + stub router
+  liq-core          state store, candidate bands, profitability, FundingStrategy, Instruction
+  liq-streaming     Geyser trait, mock, failover, Yellowstone stub, fixtures, RPC bootstrap
+  liq-kamino        klend health + liquidate v2 + flash + tx_builder
+  liq-project0      classic + receivership wire builders
+  liq-save          Save/Solend health + flash atomic plan
+  liq-execution     dry-run / submit + funding opportunity JSON
+  liq-routing       SwapRouter (stub / Jupiter placeholder / DirectDex) + RouteCache
   liq-risk          limits + circuit breaker
   liq-telemetry     Prometheus-compatible metrics types
 bins/
   liquidator  shadow  replay  bench
-fixtures/             sample oracle ticks + borrower snapshots
-config/               example.toml + example.env
-docker/  deploy/      container + systemd unit
 ```
 
 ## Safety defaults
@@ -49,7 +60,7 @@ cp config/example.env .env          # keep DRY_RUN=true
 cp config/example.toml config/local.toml   # optional; local.toml is gitignored
 
 cargo test --workspace --lib
-cargo run -p liquidator             # smoke + idle (dry-run)
+cargo run -p liquidator             # fixture bootstrap → plan loop (dry-run)
 cargo run -p shadow -- fixtures     # fixture stream, no signing
 cargo run -p replay -- fixtures     # oracle→candidate→plan JSON lines
 cargo run -p bench                  # microbench → update BENCHMARKS.md
@@ -60,14 +71,15 @@ cargo run -p bench                  # microbench → update BENCHMARKS.md
 | File | Role |
 |------|------|
 | `config/example.toml` | Safe defaults (`dry_run`, RPC placeholder, risk, protocols) |
-| `config/example.toml` → `LIQ_CONFIG` | Override path (default `config/example.toml`) |
-| `config/example.env` | Env template for Docker/systemd |
+| `LIQ_CONFIG` | Override config path (default `config/example.toml`) |
+| `LIQ_FIXTURES` | Fixtures directory |
+| `LIQ_LOOP_TICKS` | Cap liquidator loop iterations (default: all fixture ticks in dry-run) |
 
 ### Binaries
 
 | Command | Behavior |
 |---------|----------|
-| `cargo run -p liquidator` | Load config; dry-run smoke tx; waits for Geyser only if configured |
+| `cargo run -p liquidator` | Bootstrap (fixtures if no live RPC) → stream → FundingStrategy plans → DRY_RUN opportunity JSON |
 | `cargo run -p shadow -- fixtures` | Load fixtures; print shadow opportunities; **assert DRY_RUN**; no signatures |
 | `cargo run -p replay -- fixtures` | Same path + structured opportunity JSON + dry-run execute sample |
 | `cargo run -p bench [N]` | Candidate lookup / health recompute / ix encode timings |
@@ -80,7 +92,6 @@ cargo run -p bench                  # microbench → update BENCHMARKS.md
 | `GEYSER_ENDPOINT` / `GEYSER_X_TOKEN` | Yellowstone gRPC |
 | `JITO_BLOCK_ENGINE_URL` | Bundle submission |
 | `KEYPAIR_PATH` | Funded liquidator keypair (**never commit**) |
-| `LIQ_FIXTURES` | Override fixtures directory |
 | `DRY_RUN` | Must stay `true` until creds + IDL path validated |
 
 Set `DRY_RUN=false` only after credentials, keypair, and live market pubkeys are wired.

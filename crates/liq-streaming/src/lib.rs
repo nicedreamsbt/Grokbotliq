@@ -1,10 +1,12 @@
 //! Geyser subscriber trait, mock provider, multi-provider freshness failover,
-//! fixture loading, and Yellowstone integration stubs (compile without live gRPC creds).
+//! fixture loading, RPC bootstrap, and Yellowstone integration stubs (compile without live gRPC creds).
 
+mod bootstrap;
 mod failover;
 mod fixtures;
 mod yellowstone;
 
+pub use bootstrap::*;
 pub use failover::*;
 pub use fixtures::*;
 pub use yellowstone::*;

@@ -4,6 +4,7 @@
 mod alt;
 mod bid;
 mod blockhash;
+mod funding;
 mod jito;
 mod rpc;
 mod template;
@@ -11,6 +12,7 @@ mod template;
 pub use alt::*;
 pub use bid::*;
 pub use blockhash::*;
+pub use funding::*;
 pub use jito::*;
 pub use rpc::*;
 pub use template::*;
@@ -30,9 +32,14 @@ pub struct PreparedTx {
     pub account: String,
     pub notional_usd_micro: u64,
     pub expected_profit_usd_micro: i64,
-    /// Serialized wire tx bytes (empty in dry foundations).
+    /// Serialized wire tx bytes (empty until signing).
     pub wire: Vec<u8>,
     pub ixs: Vec<String>,
+    /// Wire-ready instruction list (program_id + metas + data); signing still behind traits.
+    #[serde(default)]
+    pub instructions: Vec<liq_core::Instruction>,
+    #[serde(default)]
+    pub funding_strategy: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -162,6 +169,8 @@ mod tests {
             notional_usd_micro: 50_000_000,
             expected_profit_usd_micro: 1_000_000,
             wire: vec![],
+            instructions: vec![],
+            funding_strategy: None,
             ixs: vec!["refresh".into(), "liquidate".into()],
         };
         let r = eng.execute(&tx, 0).await.unwrap();

@@ -226,7 +226,9 @@ async fn main() -> anyhow::Result<()> {
                         notional_usd_micro: rec.notional_usd_micro,
                         expected_profit_usd_micro: rec.expected_profit_usd_micro,
                         wire: vec![],
-                        ixs: rec.plan_ixs.clone(),
+                        instructions: vec![],
+            funding_strategy: None,
+            ixs: rec.plan_ixs.clone(),
                     };
                     let res = exec.execute(&tx, 0).await?;
                     ensure!(res.dry_run, "shadow must only dry-run");

@@ -8,11 +8,13 @@ mod accounts;
 mod classic;
 mod fee_state;
 mod receivership;
+mod tx_builder;
 
 pub use accounts::*;
 pub use classic::*;
 pub use fee_state::*;
 pub use receivership::*;
+pub use tx_builder::*;
 
 use liq_core::{amount_to_usd_micro, PriceFx, Pubkey};
 use serde::{Deserialize, Serialize};
@@ -45,6 +47,8 @@ pub mod disc {
     pub const LENDING_ACCOUNT_REPAY: [u8; 8] = [79, 209, 172, 177, 222, 51, 173, 151];
     /// Anchor sighash `global:lending_account_liquidate`.
     pub const LENDING_ACCOUNT_LIQUIDATE: [u8; 8] = [214, 169, 151, 213, 251, 167, 86, 219];
+    pub const START_FLASHLOAN: [u8; 8] = [14, 131, 33, 220, 81, 186, 180, 107];
+    pub const END_FLASHLOAN: [u8; 8] = [105, 124, 201, 106, 153, 2, 8, 156];
 }
 
 /// Account discriminators from `type-crate::constants::discriminators`.

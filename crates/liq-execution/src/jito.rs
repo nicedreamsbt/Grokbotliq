@@ -67,7 +67,9 @@ mod tests {
                 notional_usd_micro: 1,
                 expected_profit_usd_micro: 1,
                 wire: vec![1, 2],
-                ixs: vec![],
+                instructions: vec![],
+            funding_strategy: None,
+            ixs: vec![],
             }],
             tip_lamports: 10_000,
         };

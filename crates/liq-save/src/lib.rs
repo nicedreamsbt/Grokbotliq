@@ -5,10 +5,12 @@
 
 mod accounts;
 mod close_factor;
+mod flash;
 mod ordering;
 
 pub use accounts::*;
 pub use close_factor::*;
+pub use flash::*;
 pub use ordering::*;
 
 use liq_core::{
@@ -45,6 +47,9 @@ pub enum SaveIx {
     WithdrawObligationCollateralAndRedeemReserveCollateral = 15,
     UpdateReserveConfig = 16,
     LiquidateObligationAndRedeemReserveCollateral = 17,
+    RedeemFees = 18,
+    FlashBorrowReserveLiquidity = 19,
+    FlashRepayReserveLiquidity = 20,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]

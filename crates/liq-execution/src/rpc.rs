@@ -72,6 +72,8 @@ mod tests {
             notional_usd_micro: 1,
             expected_profit_usd_micro: 1,
             wire: vec![],
+            instructions: vec![],
+            funding_strategy: None,
             ixs: vec![],
         };
         let r = m.send_tx(&tx).await.unwrap();

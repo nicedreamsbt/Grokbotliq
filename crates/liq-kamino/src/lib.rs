@@ -4,12 +4,16 @@
 //! Full IDL vendored at `idls/klend.json` (sha256 in PROTOCOL_RESEARCH.md).
 
 mod accounts;
+mod flash;
 mod refresh;
 mod scope;
+mod tx_builder;
 
 pub use accounts::*;
+pub use flash::*;
 pub use refresh::*;
 pub use scope::*;
+pub use tx_builder::*;
 
 use liq_core::{
     amount_to_usd_micro, health_factor_ratio, HealthFx, PriceFx, Pubkey,
