@@ -1,8 +1,15 @@
 //! Save Finance (Solend successor) adapter.
 //!
-//! Program ID verified from docs.save.finance/architecture/addresses.md.
-//! Instruction tags follow classic SPL token-lending / Solend enum ordering.
-//! Confirm against live Save binary before mainnet submit.
+//! Program ID from docs.save.finance. Instruction tags from solend-sdk 0.1.0
+//! `LendingInstruction` enum (vendored under `idls/`).
+
+mod accounts;
+mod close_factor;
+mod ordering;
+
+pub use accounts::*;
+pub use close_factor::*;
+pub use ordering::*;
 
 use liq_core::{
     amount_to_usd_micro, health_factor_ratio, HealthFx, PriceFx, Pubkey,
@@ -12,13 +19,12 @@ use thiserror::Error;
 
 pub const SAVE_PROGRAM_ID_MAINNET: &str = "So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo";
 
-/// Classic Solend close factor (50%). Confirm on-chain.
+/// Classic Solend close factor (50%). Confirm per-market on-chain.
 pub const DEFAULT_CLOSE_FACTOR_BPS: u16 = 5_000;
 
-/// LendingInstruction tag indices from solendprotocol/solana-program-library
-/// (may drift if Save upgraded — TODO verify).
+/// LendingInstruction tag indices from solend-sdk 0.1.0.
 #[repr(u8)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SaveIx {
     InitLendingMarket = 0,
     SetLendingMarketOwner = 1,
@@ -32,14 +38,21 @@ pub enum SaveIx {
     WithdrawObligationCollateral = 9,
     BorrowObligationLiquidity = 10,
     RepayObligationLiquidity = 11,
+    /// Deprecated on some builds — prefer `LiquidateObligationAndRedeemReserveCollateral`.
     LiquidateObligation = 12,
-    // later variants: LiquidateObligationAndRedeemReserveCollateral etc.
+    FlashLoan = 13,
+    DepositReserveLiquidityAndObligationCollateral = 14,
+    WithdrawObligationCollateralAndRedeemReserveCollateral = 15,
+    UpdateReserveConfig = 16,
+    LiquidateObligationAndRedeemReserveCollateral = 17,
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq, Eq)]
 pub enum SaveError {
     #[error("missing price")]
     MissingPrice,
+    #[error("empty repay")]
+    EmptyRepay,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -108,13 +121,14 @@ pub fn is_liquidatable(obl: &SaveObligation, prices: &SavePrices) -> Result<bool
     Ok(borrowed > 0 && hf.is_liquidatable())
 }
 
-pub fn max_repay(borrowed_amount: u64, close_factor_bps: u16) -> u64 {
-    (borrowed_amount as u128 * close_factor_bps as u128 / 10_000) as u64
-}
-
-/// Encode LiquidateObligation { liquidity_amount: u64 }.
 pub fn encode_liquidate_obligation(liquidity_amount: u64) -> Vec<u8> {
     let mut data = vec![SaveIx::LiquidateObligation as u8];
+    data.extend_from_slice(&liquidity_amount.to_le_bytes());
+    data
+}
+
+pub fn encode_liquidate_and_redeem(liquidity_amount: u64) -> Vec<u8> {
+    let mut data = vec![SaveIx::LiquidateObligationAndRedeemReserveCollateral as u8];
     data.extend_from_slice(&liquidity_amount.to_le_bytes());
     data
 }
@@ -132,8 +146,7 @@ pub fn liquidation_ix_order() -> &'static [&'static str] {
         "ComputeBudget",
         "RefreshReserve*",
         "RefreshObligation",
-        "LiquidateObligation",
-        "RedeemOptional",
+        "LiquidateObligationAndRedeemReserveCollateral",
         "SwapOptional",
     ]
 }
@@ -143,7 +156,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn liquidatable_and_close_factor() {
+    fn liquidatable_and_tags() {
         let coll = Pubkey::test(1, 1);
         let debt = Pubkey::test(1, 2);
         let obl = SaveObligation {
@@ -170,11 +183,11 @@ mod tests {
                 (debt, PriceFx::from_f64(1.0)),
             ],
         };
-        // allowed = 50*0.85 = 42.5; borrowed = 200 -> liquidatable
         assert!(is_liquidatable(&obl, &prices).unwrap());
         assert_eq!(max_repay(200_000_000, DEFAULT_CLOSE_FACTOR_BPS), 100_000_000);
-        let data = encode_liquidate_obligation(100);
-        assert_eq!(data[0], 12);
+        let data = encode_liquidate_and_redeem(100);
+        assert_eq!(data[0], 17);
         assert_eq!(&data[1..9], &100u64.to_le_bytes());
+        assert_eq!(encode_liquidate_obligation(1)[0], 12);
     }
 }

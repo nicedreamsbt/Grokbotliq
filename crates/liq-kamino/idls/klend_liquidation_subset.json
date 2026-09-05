@@ -1,0 +1,41 @@
+{
+  "name": "kamino_klend_liquidation_subset",
+  "programIdMainnet": "KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD",
+  "idlPackage": "@kamino-finance/klend-sdk@11.0.1",
+  "idlSha256": "2a7e311eb33ffd79241e7cb8424e2170fb487a6ba678a115ce3d9a561375670d",
+  "fullIdlPath": "crates/liq-kamino/idls/klend.json",
+  "instructionDiscriminators": {
+    "refreshReserve": [
+      2,
+      218,
+      138,
+      235,
+      79,
+      201,
+      25,
+      102
+    ],
+    "refreshObligation": [
+      33,
+      132,
+      147,
+      228,
+      151,
+      192,
+      72,
+      89
+    ],
+    "liquidateObligationAndRedeemReserveCollateralV2": [
+      162,
+      161,
+      35,
+      143,
+      30,
+      187,
+      185,
+      103
+    ]
+  },
+  "scopeMaxSlots": 512,
+  "source": "unpkg @kamino-finance/klend-sdk@11.0.1 dist/@codegen/klend/instructions/*.js + dist/idl/klend.json"
+}

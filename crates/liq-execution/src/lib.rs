@@ -1,4 +1,19 @@
-//! Transaction submission: dry-run, RPC placeholder, Jito placeholder.
+//! Transaction submission: dry-run, bid profiles, Jito/RPC traits + mocks,
+//! blockhash cache, ALT manager skeleton, tx template cache.
+
+mod alt;
+mod bid;
+mod blockhash;
+mod jito;
+mod rpc;
+mod template;
+
+pub use alt::*;
+pub use bid::*;
+pub use blockhash::*;
+pub use jito::*;
+pub use rpc::*;
+pub use template::*;
 
 use async_trait::async_trait;
 use liq_risk::{CircuitBreaker, RiskReject};
@@ -34,6 +49,8 @@ pub enum ExecError {
     Risk(#[from] RiskReject),
     #[error("submit failed: {0}")]
     Submit(String),
+    #[error("stale blockhash")]
+    StaleBlockhash,
 }
 
 #[derive(Debug, Clone)]
@@ -41,6 +58,7 @@ pub struct ExecConfig {
     pub dry_run: bool,
     pub rpc_url: String,
     pub jito_block_engine_url: Option<String>,
+    pub bid_profile: BidProfile,
 }
 
 impl Default for ExecConfig {
@@ -49,6 +67,7 @@ impl Default for ExecConfig {
             dry_run: true,
             rpc_url: "https://api.mainnet-beta.solana.com".into(),
             jito_block_engine_url: None,
+            bid_profile: BidProfile::Balanced,
         }
     }
 }
@@ -62,6 +81,8 @@ pub struct ExecutionEngine {
     pub config: ExecConfig,
     pub risk: Arc<CircuitBreaker>,
     pub metrics: Arc<Metrics>,
+    pub blockhashes: Arc<BlockhashCache>,
+    pub templates: Arc<TxTemplateCache>,
 }
 
 impl ExecutionEngine {
@@ -70,6 +91,8 @@ impl ExecutionEngine {
             config,
             risk,
             metrics,
+            blockhashes: Arc::new(BlockhashCache::new(60)),
+            templates: Arc::new(TxTemplateCache::new()),
         }
     }
 
@@ -78,6 +101,15 @@ impl ExecutionEngine {
             .check_allow(tx.notional_usd_micro, oracle_staleness_slots)?;
         self.metrics.liquidations_attempted.inc();
         self.risk.begin(tx.notional_usd_micro);
+
+        let bid = self.config.bid_profile.compute_bid(tx.expected_profit_usd_micro.max(0) as u64);
+        info!(
+            target: "liq_execution",
+            profile = ?self.config.bid_profile,
+            priority_micro_lamports = bid.priority_fee_micro_lamports,
+            jito_tip = bid.jito_tip_lamports,
+            "computed bid"
+        );
 
         if self.config.dry_run {
             self.metrics.dry_run_skips.inc();
@@ -93,13 +125,15 @@ impl ExecutionEngine {
                 signature: None,
                 dry_run: true,
                 accepted: true,
-                detail: "dry_run".into(),
+                detail: format!(
+                    "dry_run tip={} prio={}",
+                    bid.jito_tip_lamports, bid.priority_fee_micro_lamports
+                ),
             });
         }
 
-        // Live path placeholders — require credentials.
         if self.config.jito_block_engine_url.is_some() {
-            warn!("Jito submit not wired yet; falling back to stub");
+            warn!("Jito live submit not wired; credentials required");
         }
         self.risk.end_failure();
         self.metrics.liquidations_failed.inc();
@@ -115,10 +149,12 @@ mod tests {
     use liq_risk::RiskLimits;
 
     #[tokio::test]
-    async fn dry_run_succeeds() {
+    async fn dry_run_succeeds_with_bid() {
         let metrics = Arc::new(Metrics::new());
         let risk = Arc::new(CircuitBreaker::new(RiskLimits::default(), metrics.clone()));
-        let eng = ExecutionEngine::new(ExecConfig::default(), risk, metrics.clone());
+        let mut cfg = ExecConfig::default();
+        cfg.bid_profile = BidProfile::Aggressive;
+        let eng = ExecutionEngine::new(cfg, risk, metrics.clone());
         let tx = PreparedTx {
             label: "test".into(),
             protocol: "kamino".into(),
@@ -130,6 +166,7 @@ mod tests {
         };
         let r = eng.execute(&tx, 0).await.unwrap();
         assert!(r.dry_run);
+        assert!(r.detail.contains("tip="));
         assert_eq!(metrics.dry_run_skips.get(), 1);
     }
 }

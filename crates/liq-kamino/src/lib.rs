@@ -1,7 +1,15 @@
-//! Kamino klend adapter: health math + instruction layout helpers.
+//! Kamino klend adapter: health math + liquidate v2 builders.
 //!
-//! Discriminators: TODO load from published klend IDL at build time.
-//! Layouts below match public docs / terminator patterns researched 2026-09-05.
+//! Discriminators pinned from `@kamino-finance/klend-sdk@11.0.1` codegen.
+//! Full IDL vendored at `idls/klend.json` (sha256 in PROTOCOL_RESEARCH.md).
+
+mod accounts;
+mod refresh;
+mod scope;
+
+pub use accounts::*;
+pub use refresh::*;
+pub use scope::*;
 
 use liq_core::{
     amount_to_usd_micro, health_factor_ratio, HealthFx, PriceFx, Pubkey,
@@ -16,12 +24,26 @@ pub const SCOPE_PROGRAM_ID_MAINNET: &str = "HFn8GnPADiny6XqUoWE8uRPPxb29ikn4yTuP
 /// Scope chain sentinel (unused hop).
 pub const SCOPE_CHAIN_SENTINEL: u16 = 65535;
 
-#[derive(Debug, Error)]
+/// Scope prices older than this many slots are treated as stale (kamino docs / research).
+pub const SCOPE_MAX_AGE_SLOTS: u64 = 512;
+
+pub mod disc {
+    /// From klend-sdk codegen `refreshReserve.js`.
+    pub const REFRESH_RESERVE: [u8; 8] = [2, 218, 138, 235, 79, 201, 25, 102];
+    /// From klend-sdk codegen `refreshObligation.js`.
+    pub const REFRESH_OBLIGATION: [u8; 8] = [33, 132, 147, 228, 151, 192, 72, 89];
+    /// From klend-sdk codegen `liquidateObligationAndRedeemReserveCollateralV2.js`.
+    pub const LIQUIDATE_V2: [u8; 8] = [162, 161, 35, 143, 30, 187, 185, 103];
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
 pub enum KaminoError {
     #[error("missing price for asset")]
     MissingPrice,
     #[error("invalid amount")]
     InvalidAmount,
+    #[error("scope oracle stale")]
+    ScopeStale,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,6 +84,7 @@ impl PriceMap {
 }
 
 /// Compute HF and whether liquidatable using klend-style thresholds.
+/// Liquidatable when borrowed > sum(deposit * liq_threshold).
 pub fn obligation_health(
     obl: &KaminoObligation,
     prices: &PriceMap,
@@ -91,7 +114,7 @@ pub fn is_liquidatable(obl: &KaminoObligation, prices: &PriceMap) -> Result<bool
     Ok(borrowed > 0 && hf.is_liquidatable())
 }
 
-/// Approximate max repay given close factor (bps of largest borrow).
+/// Approximate max repay given close factor (bps of borrowed amount).
 pub fn max_repay_amount(borrowed_amount: u64, close_factor_bps: u16) -> u64 {
     (borrowed_amount as u128 * close_factor_bps as u128 / 10_000) as u64
 }
@@ -107,8 +130,6 @@ pub fn collateral_out_amount(
 ) -> u64 {
     let repay_usd = amount_to_usd_micro(repay_amount as u128, repay_decimals, repay_price);
     let with_bonus = repay_usd * (10_000 + bonus_bps as u128) / 10_000;
-    // convert micro USD back to token amount
-    // amount = usd_micro * 10^dec * 1e9 / (price * 1e6)
     let num = with_bonus
         .saturating_mul(10u128.pow(withdraw_decimals as u32))
         .saturating_mul(PriceFx::SCALE);
@@ -119,37 +140,26 @@ pub fn collateral_out_amount(
     (num / den) as u64
 }
 
-/// Account meta description for liquidate v2 (names only; keys filled by runtime).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LiquidateV2Accounts {
-    pub liquidator: Pubkey,
-    pub obligation: Pubkey,
-    pub lending_market: Pubkey,
-    pub lending_market_authority: Pubkey,
-    pub repay_reserve: Pubkey,
-    pub withdraw_reserve: Pubkey,
-    pub user_source_liquidity: Pubkey,
-    pub user_destination_collateral: Pubkey,
-    pub user_destination_liquidity: Pubkey,
-    /// Remaining: deposit reserves for health.
-    pub deposit_reserves: Vec<Pubkey>,
-}
-
 /// Instruction data for liquidate_obligation_and_redeem_reserve_collateral_v2.
-/// TODO: replace DISCRIMINATOR with IDL sighash once klend.json is vendored.
-pub const LIQUIDATE_V2_DISCRIMINATOR: [u8; 8] = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01]; // placeholder
-
 pub fn encode_liquidate_v2_data(
     liquidity_amount: u64,
     min_acceptable_received: u64,
     max_allowed_ltv_override_percent: u64,
 ) -> Vec<u8> {
     let mut data = Vec::with_capacity(8 + 8 * 3);
-    data.extend_from_slice(&LIQUIDATE_V2_DISCRIMINATOR);
+    data.extend_from_slice(&disc::LIQUIDATE_V2);
     data.extend_from_slice(&liquidity_amount.to_le_bytes());
     data.extend_from_slice(&min_acceptable_received.to_le_bytes());
     data.extend_from_slice(&max_allowed_ltv_override_percent.to_le_bytes());
     data
+}
+
+pub fn encode_refresh_reserve() -> Vec<u8> {
+    disc::REFRESH_RESERVE.to_vec()
+}
+
+pub fn encode_refresh_obligation() -> Vec<u8> {
+    disc::REFRESH_OBLIGATION.to_vec()
 }
 
 /// Suggested ix ordering labels for a Kamino liquidation tx.
@@ -178,14 +188,14 @@ mod tests {
             deposits: vec![KaminoDeposit {
                 reserve: Pubkey::test(3, 1),
                 mint: coll,
-                deposited_amount: 10_000_000_000, // 10 SOL
+                deposited_amount: 10_000_000_000,
                 decimals: 9,
                 liq_threshold_bps: 8000,
             }],
             borrows: vec![KaminoBorrow {
                 reserve: Pubkey::test(3, 2),
                 mint: debt,
-                borrowed_amount: 900_000_000, // 900 USDC
+                borrowed_amount: 900_000_000,
                 decimals: 6,
             }],
         };
@@ -195,15 +205,16 @@ mod tests {
                 (debt, PriceFx::from_f64(1.0)),
             ],
         };
-        // allowed = 10*100*0.8 = 800; borrowed = 900 -> unhealthy
         assert!(is_liquidatable(&obl, &prices).unwrap());
         let (hf, _, _) = obligation_health(&obl, &prices).unwrap();
         assert!(hf.is_liquidatable());
     }
 
     #[test]
-    fn encode_liquidate_data_len() {
+    fn encode_liquidate_data_matches_sdk_disc() {
         let d = encode_liquidate_v2_data(1_000_000, 0, 0);
         assert_eq!(d.len(), 32);
+        assert_eq!(&d[..8], &disc::LIQUIDATE_V2);
+        assert_eq!(disc::LIQUIDATE_V2, [162, 161, 35, 143, 30, 187, 185, 103]);
     }
 }

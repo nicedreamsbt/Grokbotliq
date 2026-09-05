@@ -128,6 +128,7 @@ dependencies = [
  "liq-core",
  "liq-risk",
  "liq-telemetry",
+ "parking_lot",
  "serde",
  "thiserror",
  "tokio",

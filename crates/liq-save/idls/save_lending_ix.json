@@ -1,0 +1,37 @@
+{
+  "name": "save_solend_lending_instructions",
+  "programIdMainnet": "So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo",
+  "source": {
+    "repo": "https://github.com/solendprotocol/solana-program-library",
+    "file": "token-lending/program/src/instruction.rs",
+    "docs": "https://docs.save.finance/architecture/user-instructions",
+    "pinned_at": "2026-09-05",
+    "note": "Tag indices from classic SPL token-lending / Solend enum. Save may add later variants; verify before mainnet."
+  },
+  "tags": {
+    "RefreshReserve": 3,
+    "RefreshObligation": 7,
+    "LiquidateObligation": 12,
+    "LiquidateObligationAndRedeemReserveCollateral": 17
+  },
+  "ordering": [
+    "RefreshReserve*",
+    "RefreshObligation",
+    "LiquidateObligationAndRedeemReserveCollateral"
+  ],
+  "closeFactorBpsDefault": 5000,
+  "accounts_LiquidateObligation": [
+    "source_liquidity(mut)",
+    "destination_collateral(mut)",
+    "repay_reserve(mut)",
+    "repay_reserve_liquidity_supply(mut)",
+    "withdraw_reserve",
+    "withdraw_reserve_collateral_supply(mut)",
+    "obligation(mut)",
+    "lending_market",
+    "lending_market_authority",
+    "user_transfer_authority(signer)",
+    "clock",
+    "token_program"
+  ]
+}

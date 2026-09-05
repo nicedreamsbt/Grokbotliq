@@ -1,0 +1,266 @@
+{
+  "name": "marginfi_v2_liquidation_subset",
+  "programIdMainnet": "MFv2hWf31Z9kbCa1snEPYctwafyhdvnV7FZnsebVacA",
+  "programIdStaging": "stag8sTKds2h4KzjUw3zKTsxbqvT4XKHdaR9X9E6Rct",
+  "source": {
+    "repo": "https://github.com/0dotxyz/marginfi-v2",
+    "files": [
+      "type-crate/src/constants.rs",
+      "type-crate/src/types/fee_state.rs",
+      "programs/marginfi/src/instructions/marginfi_account/liquidate.rs",
+      "programs/marginfi/src/instructions/marginfi_account/liquidate_start.rs",
+      "programs/marginfi/src/instructions/marginfi_account/liquidate_end.rs"
+    ],
+    "pinned_at": "2026-09-05",
+    "note": "Subset extracted from Rust sources; not a full Anchor IDL export."
+  },
+  "accountDiscriminators": {
+    "GROUP": [
+      182,
+      23,
+      173,
+      240,
+      151,
+      206,
+      182,
+      67
+    ],
+    "BANK": [
+      142,
+      49,
+      166,
+      242,
+      50,
+      66,
+      97,
+      188
+    ],
+    "ACCOUNT": [
+      67,
+      178,
+      130,
+      109,
+      126,
+      114,
+      28,
+      42
+    ],
+    "FEE_STATE": [
+      63,
+      224,
+      16,
+      85,
+      193,
+      36,
+      235,
+      220
+    ],
+    "LIQUIDATION_RECORD": [
+      95,
+      116,
+      23,
+      132,
+      89,
+      210,
+      245,
+      162
+    ]
+  },
+  "instructionDiscriminators": {
+    "init_liquidation_record": [
+      236,
+      213,
+      238,
+      126,
+      147,
+      251,
+      164,
+      8
+    ],
+    "start_liquidation": [
+      244,
+      93,
+      90,
+      214,
+      192,
+      166,
+      191,
+      21
+    ],
+    "end_liquidation": [
+      110,
+      11,
+      244,
+      54,
+      229,
+      181,
+      22,
+      184
+    ],
+    "lending_account_withdraw": [
+      36,
+      72,
+      74,
+      19,
+      210,
+      210,
+      192,
+      192
+    ],
+    "lending_account_repay": [
+      79,
+      209,
+      172,
+      177,
+      222,
+      51,
+      173,
+      151
+    ],
+    "lending_account_liquidate": [
+      214,
+      169,
+      151,
+      213,
+      251,
+      167,
+      86,
+      219
+    ]
+  },
+  "feeState": {
+    "seed": "feestate",
+    "accountDiscriminator": [
+      63,
+      224,
+      16,
+      85,
+      193,
+      36,
+      235,
+      220
+    ],
+    "v1Len": 256,
+    "structSizeClaimed": 512,
+    "fields": [
+      {
+        "name": "key",
+        "type": "[u8;32]"
+      },
+      {
+        "name": "global_fee_admin",
+        "type": "[u8;32]"
+      },
+      {
+        "name": "global_fee_wallet",
+        "type": "[u8;32]"
+      },
+      {
+        "name": "account_transfer_fee",
+        "type": "u32"
+      },
+      {
+        "name": "_placeholder0",
+        "type": "[u8;4]"
+      },
+      {
+        "name": "bank_init_flat_sol_fee",
+        "type": "u32"
+      },
+      {
+        "name": "bump_seed",
+        "type": "u8"
+      },
+      {
+        "name": "_padding0",
+        "type": "[u8;3]"
+      },
+      {
+        "name": "liquidation_max_fee",
+        "type": "WrappedI80F48"
+      },
+      {
+        "name": "program_fee_fixed",
+        "type": "WrappedI80F48"
+      },
+      {
+        "name": "program_fee_rate",
+        "type": "WrappedI80F48"
+      },
+      {
+        "name": "panic_state",
+        "type": "PanicState"
+      },
+      {
+        "name": "placeholder1",
+        "type": "u64"
+      },
+      {
+        "name": "liquidation_flat_sol_fee",
+        "type": "u32"
+      },
+      {
+        "name": "order_init_flat_sol_fee",
+        "type": "u32"
+      },
+      {
+        "name": "order_execution_max_fee",
+        "type": "WrappedI80F48"
+      },
+      {
+        "name": "pause_delegate_admin",
+        "type": "[u8;32]"
+      },
+      {
+        "name": "_reserved0",
+        "type": "[u64;32]"
+      }
+    ],
+    "WrappedI80F48": "i128 little-endian fixed-point (I80F48)"
+  },
+  "accounts": {
+    "start_liquidation": [
+      "marginfi_account(mut)",
+      "liquidation_record(mut)",
+      "group",
+      "liquidation_receiver",
+      "instruction_sysvar",
+      "...remaining banks/oracles writable"
+    ],
+    "end_liquidation": [
+      "marginfi_account(mut)",
+      "liquidation_record(mut)",
+      "group",
+      "liquidation_receiver(mut,signer)",
+      "fee_state",
+      "global_fee_wallet(mut)",
+      "system_program",
+      "fee_payer(optional mut signer)"
+    ],
+    "lending_account_liquidate": [
+      "group",
+      "asset_bank(mut)",
+      "liab_bank(mut)",
+      "liquidator_marginfi_account(mut)",
+      "authority(signer)",
+      "liquidatee_marginfi_account(mut)",
+      "bank_liquidity_vault_authority",
+      "bank_liquidity_vault(mut)",
+      "bank_insurance_vault(mut)",
+      "token_program",
+      "...remaining oracles/observations"
+    ]
+  },
+  "math": {
+    "classic": {
+      "q_ll": "q_a * p_a * (1 - f_l) / p_l",
+      "q_lf": "q_a * p_a * (1 - (f_l + f_i)) / p_l",
+      "default_f_l": 0.025,
+      "default_f_i": 0.025
+    },
+    "receivership": {
+      "constraint": "seized <= repaid * (1 + liquidation_max_fee)",
+      "health": "must improve; typically cannot raise maint health above 0 except closeout threshold"
+    }
+  }
+}
