@@ -1,0 +1,15 @@
+[package]
+name = "liq-execution"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+liq-core = { workspace = true }
+liq-telemetry = { workspace = true }
+liq-risk = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }

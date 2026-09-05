@@ -1,0 +1,15 @@
+# Grokbotliq example config — safe defaults
+dry_run = true
+rpc_url = "https://YOUR_PRIVATE_RPC"
+# geyser_endpoint = "https://YOUR_GEYSER_GRPC"
+# jito_block_engine_url = "https://YOUR_JITO_BLOCK_ENGINE"
+min_profit_usd = 0.5
+
+[risk]
+max_concurrent_liquidations = 4
+oracle_max_staleness_slots = 30
+
+[protocols]
+kamino = true
+project0 = true
+save = true

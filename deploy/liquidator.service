@@ -1,0 +1,19 @@
+[Unit]
+Description=Grokbotliq Solana liquidator
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=liq
+WorkingDirectory=/opt/grokbotliq
+EnvironmentFile=/opt/grokbotliq/config/local.env
+ExecStart=/opt/grokbotliq/target/release/liquidator
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=65536
+# Do not commit key material; mount secrets separately.
+# Environment=KEYPAIR_PATH=/run/secrets/liquidator.json
+
+[Install]
+WantedBy=multi-user.target

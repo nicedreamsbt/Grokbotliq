@@ -1,0 +1,45 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/liq-core",
+  "crates/liq-streaming",
+  "crates/liq-kamino",
+  "crates/liq-project0",
+  "crates/liq-save",
+  "crates/liq-execution",
+  "crates/liq-routing",
+  "crates/liq-risk",
+  "crates/liq-telemetry",
+  "bins/liquidator",
+  "bins/shadow",
+  "bins/replay",
+  "bins/bench",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Grokbotliq"]
+
+[workspace.dependencies]
+liq-core = { path = "crates/liq-core" }
+liq-streaming = { path = "crates/liq-streaming" }
+liq-kamino = { path = "crates/liq-kamino" }
+liq-project0 = { path = "crates/liq-project0" }
+liq-save = { path = "crates/liq-save" }
+liq-execution = { path = "crates/liq-execution" }
+liq-routing = { path = "crates/liq-routing" }
+liq-risk = { path = "crates/liq-risk" }
+liq-telemetry = { path = "crates/liq-telemetry" }
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+parking_lot = "0.12"
+async-trait = "0.1"
+bytes = "1"

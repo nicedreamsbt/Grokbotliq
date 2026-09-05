@@ -1,0 +1,27 @@
+[package]
+name = "bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Microbenchmarks for index / health / profitability"
+
+[[bin]]
+name = "bench"
+path = "src/main.rs"
+
+[dependencies]
+liq-core = { workspace = true }
+liq-streaming = { workspace = true }
+liq-kamino = { workspace = true }
+liq-project0 = { workspace = true }
+liq-save = { workspace = true }
+liq-execution = { workspace = true }
+liq-routing = { workspace = true }
+liq-risk = { workspace = true }
+liq-telemetry = { workspace = true }
+anyhow = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }

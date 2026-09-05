@@ -1,0 +1,10 @@
+services:
+  liquidator:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    env_file:
+      - ../config/example.env
+    environment:
+      DRY_RUN: "true"
+    restart: unless-stopped

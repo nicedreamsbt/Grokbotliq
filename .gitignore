@@ -1,0 +1,16 @@
+/target/
+**/*.rs.bk
+.env
+.env.*
+!.env.example
+config/local.toml
+*.pem
+*.key
+**/id.json
+**/liquidator.json
+**/keypair*.json
+.keys/
+keys/
+.secrets/
+*.log
+.DS_Store
