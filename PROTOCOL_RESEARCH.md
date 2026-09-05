@@ -99,7 +99,9 @@ FlashBorrow accounts (7): source_liquidity(mut), destination_liquidity(mut), res
 
 FlashRepay accounts (9): source(mut), destination(mut), fee_receiver(mut), host_fee_receiver(mut), reserve(mut), lending_market, user_transfer_authority(signer), instructions sysvar, token_program.
 
-**Verification TODO:** Confirm Save mainnet program still packs tags 19/20 identically before live submit. Default modeled flash fee: 9 bps (`DEFAULT_FLASH_FEE_BPS`) until reserve `flash_loan_fee_wad` is read on-chain.
+**Account metas (W/RO):** Reconciled against public solend-sdk 0.1.0 instruction helpers — FlashBorrow (7), FlashRepay (9), LiquidateAndRedeem (15). Unit tests lock writable vs readonly flags. Remaining uncertainty: Save mainnet may still diverge on tag 19/20 packing or host-fee account semantics before live submit.
+
+Default modeled flash fee: 9 bps (`DEFAULT_FLASH_FEE_BPS`) until reserve `flash_loan_fee_wad` is read on-chain.
 
 ### Kamino (klend)
 
@@ -113,7 +115,11 @@ Discriminators (Anchor `sha256("global:<snake>")[0..8]`, same method as pinned r
 
 Args: borrow `{ liquidityAmount: u64 }`; repay `{ liquidityAmount: u64, borrowInstructionIndex: u8 }`.
 
-**Verification TODO:** Re-pin against `@kamino-finance/klend-sdk` codegen JS (IDL JSON pin lacks discriminator arrays). `KAMINO_FLASH_SUPPORTED = true` in code; inventory + post-liq swap remains available if flash is disabled at runtime.
+**Discriminators:** User-verified 2026-09-05 against current klend-sdk codegen (borrow/repay arrays above). TODO closed for disc values.
+
+**Optional referrer metas:** When `referrerTokenState` / `referrerAccount` absent, official codegen uses **KLend program ID as readonly** — not lending_market as a writable placeholder. Implemented in `liq-kamino::flash`.
+
+`KAMINO_FLASH_SUPPORTED = true`; inventory + post-liq swap remains available if flash is disabled at runtime.
 
 ### Project 0 receivership (flash alternative)
 
@@ -123,11 +129,12 @@ Receivership is a first-class `FundingStrategy::Project0Receivership` that can a
 
 Wire builders in `liq-project0::tx_builder` emit real `Instruction` lists (program_id, account metas, data bytes). Upstream also exposes `START_FLASHLOAN` / `END_FLASHLOAN` discriminators for marginfi flash loans (not required for receivership path).
 
-## 4. Streaming / Yellowstone
+## 4. Streaming / Yellowstone / RPC
 
 - Trait + mock + **multi-provider freshness failover** in `liq-streaming`
-- Yellowstone integration points: `YellowstoneConfig` / `YellowstoneSubscriber` (stub; compiles without gRPC creds)
-- Env: `GEYSER_ENDPOINT`, `GEYSER_X_TOKEN`, optional `GEYSER_COMMITMENT`, `GEYSER_PING_MS`
+- **HTTP JSON-RPC (reqwest)** `HttpJsonRpcTransport` + `JsonRpcBootstrap`: `getAccountInfo`, `getMultipleAccounts`, `getProgramAccounts`, `simulateTransaction` (config `rpc_url` / `RPC_URL`; fails clearly on placeholder)
+- Yellowstone: stub retained; **prefer working RPC bootstrap** over half-broken gRPC until yellowstone-grpc is linked
+- Env: `GEYSER_ENDPOINT`, `GEYSER_X_TOKEN`, optional `GEYSER_COMMITMENT`, `GEYSER_PING_MS`; `LIQ_FIXTURES` for offline CI
 
 ## 5. Needs live credentials (still)
 
@@ -139,5 +146,7 @@ Wire builders in `liq-project0::tx_builder` emit real `Instruction` lists (progr
 6. Optional: re-pin IDLs when upstream releases
 7. Live FeeState account for receivership max fee
 8. Per-asset liq threshold / bonus / close-factor confirmation on-chain
-9. Flash fee / tag verification (Save 19/20; Kamino flash discs vs SDK codegen)
-10. Live getProgramAccounts bootstrap + Yellowstone account-update decode
+9. Flash fee / Save tag 19/20 mainnet re-verify (Kamino flash discs verified)
+10. Full Anchor zero-copy decode (planning fixture decode exists for Kamino obligations)
+11. Yellowstone live gRPC client (RPC path is real; gRPC still stub)
+12. VersionedTransaction signing + Jito auth

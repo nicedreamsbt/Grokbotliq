@@ -1,6 +1,11 @@
-//! Swap routing: Jupiter instruction placeholder + DirectDex stub + route cache.
+//! Swap routing: Jupiter quote-blob attach + DirectDex stub + route cache.
+//!
+//! Placeholder routers remain for dry planning. Prefer [`JupiterQuoteBlob`] when a
+//! real Jupiter swap-instructions JSON is available; otherwise omit swap ixs
+//! rather than faking executable bytes.
 
 use async_trait::async_trait;
+use base64::Engine;
 use liq_core::{
     programs, AccountMeta, Instruction, LabeledIx, PriceFx, Pubkey,
 };
@@ -161,6 +166,114 @@ fn mid_quote(req: &QuoteRequest, label: &str) -> Result<Quote, RouteError> {
     })
 }
 
+
+/// Real Jupiter swap instructions loaded from a quote/ix JSON blob (file or API).
+/// Expected shape (Jupiter `/swap-instructions` subset):
+/// `{ "swapInstruction": { "programId": "<b58>", "accounts": [{"pubkey","isSigner","isWritable"}], "data": "<base64>" } }`
+/// or `{ "instructions": [ ... ] }`. If no usable ix is present, attach returns empty
+/// and marks the path incomplete — never invents placeholder program data.
+#[derive(Debug, Clone)]
+pub struct JupiterQuoteBlob {
+    pub instructions: Vec<LabeledIx>,
+    pub incomplete: bool,
+}
+
+impl Default for JupiterQuoteBlob {
+    fn default() -> Self {
+        Self {
+            instructions: vec![],
+            incomplete: true,
+        }
+    }
+}
+
+impl JupiterQuoteBlob {
+    fn parse_one_ix(obj: &serde_json::Value) -> Option<LabeledIx> {
+        let program_id_s = obj.get("programId")?.as_str()?;
+        let program_id = Pubkey::from_base58(program_id_s)?;
+        let data_s = obj.get("data")?.as_str()?;
+        let data = base64::engine::general_purpose::STANDARD.decode(data_s).ok()?;
+        if data.is_empty() {
+            return None;
+        }
+        let accounts = obj
+            .get("accounts")
+            .and_then(|a| a.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|m| {
+                        let pk = Pubkey::from_base58(m.get("pubkey")?.as_str()?)?;
+                        let is_signer = m.get("isSigner").and_then(|x| x.as_bool()).unwrap_or(false);
+                        let is_writable =
+                            m.get("isWritable").and_then(|x| x.as_bool()).unwrap_or(false);
+                        Some(if is_writable {
+                            AccountMeta::new(pk, is_signer)
+                        } else {
+                            AccountMeta::new_readonly(pk, is_signer)
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        Some(LabeledIx {
+            label: "jupiter_swap".into(),
+            ix: Instruction::new(program_id, accounts, data),
+        })
+    }
+
+    pub fn from_json_value(v: &serde_json::Value) -> Self {
+        let mut instructions = Vec::new();
+        if let Some(si) = v.get("swapInstruction") {
+            if let Some(ix) = Self::parse_one_ix(si) {
+                instructions.push(ix);
+            }
+        }
+        if let Some(arr) = v.get("instructions").and_then(|a| a.as_array()) {
+            for item in arr {
+                if let Some(ix) = Self::parse_one_ix(item) {
+                    instructions.push(ix);
+                }
+            }
+        }
+        if instructions.is_empty() {
+            if let Some(ix) = Self::parse_one_ix(v) {
+                instructions.push(ix);
+            }
+        }
+        let incomplete = instructions.is_empty();
+        Self {
+            instructions,
+            incomplete,
+        }
+    }
+
+    pub fn from_json_str(s: &str) -> Result<Self, serde_json::Error> {
+        let v: serde_json::Value = serde_json::from_str(s)?;
+        Ok(Self::from_json_value(&v))
+    }
+
+    pub fn from_file(path: impl AsRef<std::path::Path>) -> Result<Self, String> {
+        let raw = std::fs::read_to_string(path.as_ref()).map_err(|e| e.to_string())?;
+        Self::from_json_str(&raw).map_err(|e| e.to_string())
+    }
+
+    /// Attach real swap ixs, or return empty + incomplete=true when no quote.
+    pub fn attach_or_omit(&self) -> (Vec<LabeledIx>, bool) {
+        (self.instructions.clone(), self.incomplete)
+    }
+
+    /// Env/file helper: `JUPITER_SWAP_IX_JSON` path → blob, else incomplete.
+    pub fn from_env() -> Self {
+        match std::env::var("JUPITER_SWAP_IX_JSON") {
+            Ok(path) => Self::from_file(path).unwrap_or_default(),
+            Err(_) => Self {
+                instructions: vec![],
+                incomplete: true,
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct RouteKey {
     pub input: Pubkey,
@@ -271,5 +384,28 @@ mod tests {
                 output: b
             })
             .is_some());
+    }
+
+    #[test]
+    fn jupiter_quote_blob_attaches_real_bytes_or_omits() {
+        let prog = Pubkey::test(74, 9);
+        let data_b64 = base64::engine::general_purpose::STANDARD.encode(b"REALJUP");
+        let json = serde_json::json!({
+            "swapInstruction": {
+                "programId": prog.to_base58(),
+                "accounts": [{
+                    "pubkey": Pubkey::test(74, 10).to_base58(),
+                    "isSigner": false,
+                    "isWritable": true
+                }],
+                "data": data_b64
+            }
+        });
+        let blob = JupiterQuoteBlob::from_json_value(&json);
+        assert!(!blob.incomplete);
+        assert_eq!(blob.instructions[0].ix.data, b"REALJUP");
+        let empty = JupiterQuoteBlob::from_json_value(&serde_json::json!({}));
+        assert!(empty.incomplete);
+        assert!(empty.instructions.is_empty());
     }
 }

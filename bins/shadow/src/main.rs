@@ -3,15 +3,19 @@
 
 use anyhow::{bail, ensure, Context};
 use liq_core::{
-    CandidateIndex, OracleTriggerPath, PriceFx, ProfitConfig, ProfitDecision, ProfitInput,
-    ProfitabilityCalculator, Protocol, TriggerHit, UpdateSource,
+    CandidateIndex, FundingStrategy, OracleTriggerPath, PriceFx, ProfitConfig, ProfitDecision,
+    ProfitInput, ProfitabilityCalculator, Protocol, TriggerHit, UpdateSource,
 };
-use liq_execution::{BidProfile, ExecConfig, ExecutionEngine, PreparedTx};
+use liq_execution::{
+    build_strategy_ixs, BidProfile, ExecConfig, ExecutionEngine, PlanAccountSet, PreparedTx,
+};
 use liq_risk::{CircuitBreaker, RiskLimits};
+use liq_routing::JupiterQuoteBlob;
 use liq_streaming::{
     borrower_to_meta, borrower_triggers, drain_all, load_borrowers, load_oracle_ticks,
-    resolve_fixtures_dir, ticks_to_events, BorrowerFixture, MockGeyser, StreamEvent,
-    YellowstoneConfig,
+    resolve_fixtures_dir, rpc_url_configured, shadow_tx_base64, ticks_to_events, BorrowerFixture,
+    FixtureBootstrap, HttpJsonRpcTransport, JsonRpcBootstrap, MockGeyser, RpcBootstrap,
+    StreamEvent, YellowstoneConfig,
 };
 use liq_telemetry::Metrics;
 use serde::Serialize;
@@ -219,21 +223,57 @@ async fn main() -> anyhow::Result<()> {
                 count += 1;
 
                 if would {
+                    let strategy = match meta.protocol {
+                        Protocol::Kamino => FundingStrategy::KaminoFlashBorrow,
+                        Protocol::Save => FundingStrategy::SaveFlashLoan,
+                        Protocol::Project0 => FundingStrategy::Project0Receivership,
+                    };
+                    let accounts = PlanAccountSet::from_seed(meta.account);
+                    let planned = build_strategy_ixs(
+                        meta.protocol,
+                        strategy,
+                        &accounts,
+                        b.plan.repay_amount,
+                        &JupiterQuoteBlob::from_env(),
+                    );
+                    let wire_ixs: Vec<_> = planned.labeled.iter().map(|l| l.ix.clone()).collect();
+                    let envelope = shadow_tx_base64(&wire_ixs, "11111111111111111111111111111111");
                     let tx = PreparedTx {
                         label: "shadow-would-submit".into(),
                         protocol: rec.protocol.clone(),
                         account: rec.account.clone(),
                         notional_usd_micro: rec.notional_usd_micro,
                         expected_profit_usd_micro: rec.expected_profit_usd_micro,
-                        wire: vec![],
-                        instructions: vec![],
-            funding_strategy: None,
-            ixs: rec.plan_ixs.clone(),
+                        wire: envelope.clone().into_bytes(),
+                        instructions: wire_ixs,
+                        funding_strategy: Some(strategy.as_str().to_string()),
+                        ixs: planned.labeled.iter().map(|l| l.label.clone()).collect(),
                     };
                     let res = exec.execute(&tx, 0).await?;
                     ensure!(res.dry_run, "shadow must only dry-run");
                     ensure!(res.signature.is_none(), "shadow must not produce signatures");
-                    info!(account = %rec.account, detail = %res.detail, "shadow dry-run only");
+                    info!(
+                        account = %rec.account,
+                        ixs = tx.instructions.len(),
+                        flash = planned.used_flash_builder,
+                        detail = %res.detail,
+                        "shadow dry-run only (no broadcast)"
+                    );
+                    // Simulate when RPC configured; fixtures always simulate locally.
+                    let rpc = std::env::var("RPC_URL").unwrap_or_else(|_| "https://YOUR_PRIVATE_RPC".into());
+                    if rpc_url_configured(&rpc) {
+                        if let Ok(transport) = HttpJsonRpcTransport::new(&rpc) {
+                            let boot = JsonRpcBootstrap::new(transport);
+                            match boot.simulate_transaction(&envelope, false).await {
+                                Ok(sim) => info!(err=?sim.err, units=?sim.units_consumed, "shadow simulateTransaction"),
+                                Err(e) => info!(error=%e, "shadow simulate skipped"),
+                            }
+                        }
+                    } else {
+                        let boot = FixtureBootstrap::demo_for_protocols();
+                        let sim = boot.simulate_transaction(&envelope, false).await?;
+                        info!(logs=?sim.logs, "shadow fixture simulate (sigVerify=false, no broadcast)");
+                    }
                 }
             }
         }

@@ -2,28 +2,28 @@
 
 Solana multi-protocol liquidation bot (Kamino / Project 0 / Save).
 
-**Status:** Beyond pure scaffold — funding path selection, protocol-exact instruction builders, flash/atomic compositions, and an ingestion→plan loop are wired. **Still not production-ready:** live Yellowstone gRPC client, live RPC decode, signing, and Jito auth are stubs. **`DRY_RUN=true` by default.** No secrets in repo.
+**Status (honest):** Flash/atomic ix builders are real and planner-wired. Shadow mode can bootstrap via **reqwest JSON-RPC** (or fixtures), build account-derived instruction lists, and call **`simulateTransaction` with `sigVerify:false`**. **Not production-ready:** live Yellowstone gRPC client, full Anchor zero-copy decode, signing, and Jito auth remain unwired. **`DRY_RUN=true` by default — never broadcasts in dry/shadow.**
 
 ## What's wired vs not
 
 | Area | Wired | Not yet |
 |------|-------|---------|
 | FundingStrategy enum + EV path pick | Inventory / SaveFlash / KaminoFlash / P0Receivership | Live inventory balances / reserve fee reads |
-| Save flash atomic plan | FlashBorrow(19) → liq → FlashRepay(20) + tests | Mainnet fee/tag re-verify (TODO in PROTOCOL_RESEARCH) |
-| Kamino flash | IDL-backed borrow/repay + Anchor discriminators | SDK codegen disc re-pin before mainnet |
-| P0 receivership | Full wire `Instruction` sequence (start→withdraw→repay→end) | Live bank/oracle remaining accounts |
-| Tx builders | Non-empty data bytes + explicit account metas | VersionedTransaction sign + LUT fill |
-| State ingestion | Fixture bootstrap + StateStore apply; JSON-RPC request shapes | reqwest/Yellowstone live clients |
-| liquidator binary | Loop: bootstrap → fixture stream → funding plans → DRY_RUN JSON | Continuous live Geyser without fixtures |
-| Routing | SwapRouter + Jupiter placeholder + DirectDex + HOT route cache | Real Jupiter/DEX quote HTTP |
-| Jito / submit | Traits + dry-run engine | Live block-engine auth |
+| Save flash atomic plan | FlashBorrow(19) → liq → FlashRepay(20); RO/W metas vs solend-sdk | Mainnet tag 19/20 re-verify |
+| Kamino flash | IDL-backed borrow/repay; **referrer absent → KLend program id RO**; discs user-verified | Live reserve fee / farm remaining accounts |
+| Planner | **`KaminoFlashBorrow` → `build_flash_tx()`**; SaveFlash → flash builder; Inventory non-flash | Config-loaded mainnet pubkeys (fixtures/seed for now) |
+| P0 receivership | Full wire `Instruction` sequence | Live bank/oracle remaining accounts |
+| State ingestion | **reqwest** `HttpJsonRpcTransport` + fixture bootstrap; planning decode for Kamino | Full IDL zero-copy + Yellowstone stream decode |
+| Shadow / simulate | Envelope + `simulateTransaction` (`sigVerify:false`); **no broadcast** | `solana-sdk` VersionedTransaction sign |
+| Routing | Jupiter **quote JSON/ix blob** attach (omit if missing); DirectDex trait | Live Jupiter quote HTTP without blob |
+| Jito / submit | Traits + dry-run engine; live submit errors if forced | Block-engine auth |
 
 ## Docs
 
 | Doc | Contents |
 |-----|----------|
-| [PROTOCOL_RESEARCH.md](./PROTOCOL_RESEARCH.md) | Program IDs, math, IDL pins, **flash loan layouts** |
-| [ARCHITECTURE.md](./ARCHITECTURE.md) | Pipeline + **FundingStrategy** diagram |
+| [PROTOCOL_RESEARCH.md](./PROTOCOL_RESEARCH.md) | Program IDs, math, IDL pins, flash layouts, meta notes |
+| [ARCHITECTURE.md](./ARCHITECTURE.md) | Pipeline + FundingStrategy + **shadow-mode boundary** |
 | [BENCHMARKS.md](./BENCHMARKS.md) | Local microbench numbers |
 | [fixtures/README.md](./fixtures/README.md) | Oracle + borrower JSON fixtures |
 
@@ -32,12 +32,12 @@ Solana multi-protocol liquidation bot (Kamino / Project 0 / Save).
 ```
 crates/
   liq-core          state store, candidate bands, profitability, FundingStrategy, Instruction
-  liq-streaming     Geyser trait, mock, failover, Yellowstone stub, fixtures, RPC bootstrap
-  liq-kamino        klend health + liquidate v2 + flash + tx_builder
+  liq-streaming     Geyser trait, mock, failover, Yellowstone stub, fixtures, **reqwest RPC**
+  liq-kamino        klend health + flash + tx_builder + planning decode
   liq-project0      classic + receivership wire builders
   liq-save          Save/Solend health + flash atomic plan
-  liq-execution     dry-run / submit + funding opportunity JSON
-  liq-routing       SwapRouter (stub / Jupiter placeholder / DirectDex) + RouteCache
+  liq-execution     dry-run / submit + funding opportunity + **strategy planner**
+  liq-routing       SwapRouter + JupiterQuoteBlob + DirectDex + RouteCache
   liq-risk          limits + circuit breaker
   liq-telemetry     Prometheus-compatible metrics types
 bins/
@@ -48,8 +48,8 @@ bins/
 
 - **`dry_run = true`** in `config/example.toml`; **`DRY_RUN=true`** in `config/example.env`
 - `shadow` **refuses** to start if `DRY_RUN=false`
-- Execution engine skips broadcast when dry-run; live submit errors until RPC/Jito creds wired
-- Circuit breaker + profitability gates before any submit path
+- Execution engine skips broadcast when dry-run; simulate path never broadcasts
+- Jito submit stays unwired / errors if forced live
 - `.gitignore` excludes `.env`, keypairs, `config/local.toml`, `target/`
 
 ## Quick start
@@ -61,52 +61,42 @@ cp config/example.toml config/local.toml   # optional; local.toml is gitignored
 
 cargo test --workspace --lib
 cargo run -p liquidator             # fixture bootstrap → plan loop (dry-run)
-cargo run -p shadow -- fixtures     # fixture stream, no signing
-cargo run -p replay -- fixtures     # oracle→candidate→plan JSON lines
-cargo run -p bench                  # microbench → update BENCHMARKS.md
+cargo run -p shadow -- fixtures     # fixture stream + simulate envelope, no signing
+cargo run -p replay -- fixtures
+cargo run -p bench
 ```
 
 ### Config
 
-| File | Role |
-|------|------|
-| `config/example.toml` | Safe defaults (`dry_run`, RPC placeholder, risk, protocols) |
-| `LIQ_CONFIG` | Override config path (default `config/example.toml`) |
-| `LIQ_FIXTURES` | Fixtures directory |
-| `LIQ_LOOP_TICKS` | Cap liquidator loop iterations (default: all fixture ticks in dry-run) |
-
-### Binaries
-
-| Command | Behavior |
-|---------|----------|
-| `cargo run -p liquidator` | Bootstrap (fixtures if no live RPC) → stream → FundingStrategy plans → DRY_RUN opportunity JSON |
-| `cargo run -p shadow -- fixtures` | Load fixtures; print shadow opportunities; **assert DRY_RUN**; no signatures |
-| `cargo run -p replay -- fixtures` | Same path + structured opportunity JSON + dry-run execute sample |
-| `cargo run -p bench [N]` | Candidate lookup / health recompute / ix encode timings |
+| File / env | Role |
+|------------|------|
+| `config/example.toml` | Safe defaults (`dry_run`, RPC placeholder) |
+| `LIQ_CONFIG` | Override config path |
+| `LIQ_FIXTURES` | Offline CI fixtures path (preferred over live RPC in CI) |
+| `RPC_URL` | Real JSON-RPC endpoint for bootstrap + simulate |
+| `JUPITER_SWAP_IX_JSON` | Path to Jupiter swap-instructions JSON; omit swap if unset |
+| `LIQ_LOOP_TICKS` | Cap liquidator loop iterations |
 
 ### Placeholders for live mode
 
 | Var | Purpose |
 |-----|---------|
-| `RPC_URL` | Private Solana RPC |
-| `GEYSER_ENDPOINT` / `GEYSER_X_TOKEN` | Yellowstone gRPC |
-| `JITO_BLOCK_ENGINE_URL` | Bundle submission |
+| `RPC_URL` | Private Solana RPC (required for non-fixture bootstrap) |
+| `GEYSER_ENDPOINT` / `GEYSER_X_TOKEN` | Yellowstone gRPC (stub until client linked) |
+| `JITO_BLOCK_ENGINE_URL` | Bundle submission (errors if forced live) |
 | `KEYPAIR_PATH` | Funded liquidator keypair (**never commit**) |
 | `DRY_RUN` | Must stay `true` until creds + IDL path validated |
-
-Set `DRY_RUN=false` only after credentials, keypair, and live market pubkeys are wired.
-
-## Docker / systemd
-
-```bash
-docker compose -f docker/docker-compose.yml build
-docker compose -f docker/docker-compose.yml up    # DRY_RUN forced true
-```
-
-Systemd unit: `deploy/liquidator.service` — expects `/opt/grokbotliq`, `config/local.env`, release `liquidator` binary. Mount key material via secrets (commented in unit); do not bake keys into the image.
 
 ## Tests
 
 ```bash
 cargo test --workspace --lib
 ```
+
+## Remaining gaps (honest)
+
+1. Yellowstone live gRPC (RPC bootstrap is the real path today)
+2. Full Anchor account layouts (planning fixture decode only for Kamino)
+3. VersionedTransaction signing + LUT fill
+4. Live Jupiter quote HTTP (blob attach works when JSON provided)
+5. Jito auth / broadcast path

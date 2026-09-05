@@ -11,6 +11,7 @@ thiserror = { workspace = true }
 parking_lot = { workspace = true }
 tracing = { workspace = true }
 bytes = { workspace = true }
+bs58 = { workspace = true }
 liq-telemetry = { workspace = true }
 
 [dev-dependencies]

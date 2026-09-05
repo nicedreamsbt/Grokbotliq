@@ -187,3 +187,94 @@ mod tests {
         assert!(!liq.ix.accounts.is_empty());
     }
 }
+
+#[cfg(test)]
+mod flash_builder_tests {
+    use super::*;
+    use crate::accounts::LiquidateV2Accounts;
+    use crate::flash::{FlashBorrowAccounts, FlashRepayAccounts};
+
+    fn sample_liq() -> LiquidateV2Accounts {
+        LiquidateV2Accounts {
+            liquidator: Pubkey::test(1, 1),
+            obligation: Pubkey::test(1, 2),
+            lending_market: Pubkey::test(1, 3),
+            lending_market_authority: Pubkey::test(1, 4),
+            repay_reserve: Pubkey::test(1, 5),
+            repay_reserve_liquidity_mint: Pubkey::test(1, 6),
+            repay_reserve_liquidity_supply: Pubkey::test(1, 7),
+            withdraw_reserve: Pubkey::test(1, 8),
+            withdraw_reserve_liquidity_mint: Pubkey::test(1, 9),
+            withdraw_reserve_collateral_mint: Pubkey::test(1, 10),
+            withdraw_reserve_collateral_supply: Pubkey::test(1, 11),
+            withdraw_reserve_liquidity_supply: Pubkey::test(1, 12),
+            withdraw_reserve_liquidity_fee_receiver: Pubkey::test(1, 13),
+            user_source_liquidity: Pubkey::test(1, 14),
+            user_destination_collateral: Pubkey::test(1, 15),
+            user_destination_liquidity: Pubkey::test(1, 16),
+            collateral_token_program: programs::token(),
+            repay_liquidity_token_program: programs::token(),
+            withdraw_liquidity_token_program: programs::token(),
+            instruction_sysvar_account: programs::sysvar_instructions(),
+            collateral_obligation_farm_user_state: None,
+            collateral_reserve_farm_state: None,
+            debt_obligation_farm_user_state: None,
+            debt_reserve_farm_state: None,
+            farms_program: Pubkey::test(1, 21),
+            deposit_reserves: vec![],
+        }
+    }
+
+    fn sample_flash() -> (FlashBorrowAccounts, FlashRepayAccounts) {
+        let borrow = FlashBorrowAccounts {
+            user_transfer_authority: Pubkey::test(3, 1),
+            lending_market_authority: Pubkey::test(1, 4),
+            lending_market: Pubkey::test(1, 3),
+            reserve: Pubkey::test(1, 5),
+            reserve_liquidity_mint: Pubkey::test(1, 6),
+            reserve_source_liquidity: Pubkey::test(1, 7),
+            user_destination_liquidity: Pubkey::test(1, 14),
+            reserve_liquidity_fee_receiver: Pubkey::test(1, 13),
+            referrer_token_state: None,
+            referrer_account: None,
+        };
+        let repay = FlashRepayAccounts {
+            user_transfer_authority: Pubkey::test(3, 1),
+            lending_market_authority: Pubkey::test(1, 4),
+            lending_market: Pubkey::test(1, 3),
+            reserve: Pubkey::test(1, 5),
+            reserve_liquidity_mint: Pubkey::test(1, 6),
+            reserve_destination_liquidity: Pubkey::test(1, 7),
+            user_source_liquidity: Pubkey::test(1, 14),
+            reserve_liquidity_fee_receiver: Pubkey::test(1, 13),
+            referrer_token_state: None,
+            referrer_account: None,
+        };
+        (borrow, repay)
+    }
+
+    #[test]
+    fn flash_tx_emits_borrow_and_repay_with_absent_referrer() {
+        let (b, r) = sample_flash();
+        let params = KaminoTxBuildParams {
+            obligation: Pubkey::test(1, 2),
+            deposit_reserves: vec![Pubkey::test(1, 8)],
+            borrow_reserves: vec![Pubkey::test(1, 5)],
+            liquidate: sample_liq(),
+            liquidity_amount: 1_000,
+            min_acceptable_received: 0,
+            max_allowed_ltv_override_percent: 0,
+            cu_limit: 400_000,
+            cu_price: 1000,
+            flash: Some((b, r)),
+        };
+        let ixs = build_flash_tx(&params, &[]).expect("flash");
+        let labels: Vec<_> = ixs.iter().map(|l| l.label.as_str()).collect();
+        assert!(labels.contains(&"flash_borrow_reserve_liquidity"));
+        assert!(labels.contains(&"flash_repay_reserve_liquidity"));
+        let borrow = ixs.iter().find(|l| l.label.contains("flash_borrow")).unwrap();
+        let ref_meta = &borrow.ix.accounts[8];
+        assert_eq!(ref_meta.pubkey, programs::klend());
+        assert!(!ref_meta.is_writable);
+    }
+}

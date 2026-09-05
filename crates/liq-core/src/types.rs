@@ -25,6 +25,16 @@ impl Pubkey {
         b[24..32].copy_from_slice(&index.to_le_bytes());
         Self(b)
     }
+
+    /// Base58 Solana address (for JSON-RPC keys).
+    pub fn to_base58(&self) -> String {
+        bs58::encode(&self.0).into_string()
+    }
+
+    pub fn from_base58(s: &str) -> Option<Self> {
+        let bytes = bs58::decode(s).into_vec().ok()?;
+        Self::from_bytes(&bytes)
+    }
 }
 
 impl fmt::Debug for Pubkey {

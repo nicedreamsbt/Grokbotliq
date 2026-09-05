@@ -7,6 +7,7 @@ mod blockhash;
 mod funding;
 mod jito;
 mod rpc;
+mod plan;
 mod template;
 
 pub use alt::*;
@@ -15,6 +16,7 @@ pub use blockhash::*;
 pub use funding::*;
 pub use jito::*;
 pub use rpc::*;
+pub use plan::*;
 pub use template::*;
 
 use async_trait::async_trait;

@@ -3,21 +3,22 @@
 
 use anyhow::Context;
 use liq_core::{
-    programs, CandidateIndex, FundingPathEnumerator, FundingStrategy, OracleTriggerPath,
-    PriceFx, ProfitConfig, ProfitDecision, Protocol, Pubkey, StateStore, UpdateSource,
+    programs, CandidateIndex, FundingPathEnumerator, OracleTriggerPath,
+    PriceFx, ProfitConfig, ProfitDecision, Pubkey, StateStore, UpdateSource,
 };
 use liq_execution::{
-    evaluate_funding, opportunity_from_best, strategy_ix_labels, BidProfile, ExecConfig,
-    ExecutionEngine, PreparedTx,
+    build_strategy_ixs, evaluate_funding, opportunity_from_best, strategy_ix_labels, BidProfile,
+    ExecConfig, ExecutionEngine, PlanAccountSet, PreparedTx,
 };
 use liq_risk::{CircuitBreaker, RiskLimits};
 use liq_routing::{RouteCache, StubRouter};
 use liq_streaming::{
     apply_account_update, apply_raw_to_store, borrower_to_meta, borrower_triggers, load_borrowers,
-    load_oracle_ticks, resolve_fixtures_dir, ticks_to_events, FixtureBootstrap, GeyserSubscriber,
-    MockGeyser, RpcBootstrap, StreamEvent, SubscribeFilter, YellowstoneConfig,
-    YellowstoneSubscriber,
+    load_oracle_ticks, resolve_fixtures_dir, rpc_url_configured, shadow_tx_base64, ticks_to_events,
+    FixtureBootstrap, GeyserSubscriber, HttpJsonRpcTransport, JsonRpcBootstrap, MockGeyser,
+    RpcBootstrap, StreamEvent, SubscribeFilter, YellowstoneConfig, YellowstoneSubscriber,
 };
+use liq_routing::JupiterQuoteBlob;
 use liq_telemetry::Metrics;
 use serde::Deserialize;
 use std::path::PathBuf;
@@ -117,11 +118,15 @@ async fn main() -> anyhow::Result<()> {
 
     // --- State store + bootstrap ---
     let store: Arc<StateStore<Vec<u8>>> = Arc::new(StateStore::new());
-    let fixtures_mode = use_fixtures()
-        || cfg.rpc_url.contains("YOUR_")
-        || std::env::var("LIQ_FIXTURES").is_ok();
+    let force_fixtures = std::env::var("LIQ_FIXTURES").is_ok() || use_fixtures();
+    let live_rpc = rpc_url_configured(&cfg.rpc_url)
+        && std::env::var("RPC_URL")
+            .map(|u| rpc_url_configured(&u))
+            .unwrap_or(rpc_url_configured(&cfg.rpc_url));
+    // Prefer LIQ_FIXTURES for CI; otherwise real RPC when url configured.
+    let rpc_url = std::env::var("RPC_URL").unwrap_or_else(|_| cfg.rpc_url.clone());
 
-    if fixtures_mode {
+    if force_fixtures || !rpc_url_configured(&rpc_url) {
         let boot = FixtureBootstrap::demo_for_protocols();
         for owner in [programs::klend(), programs::save(), programs::marginfi()] {
             let accts = boot
@@ -130,10 +135,33 @@ async fn main() -> anyhow::Result<()> {
                 .context("fixture bootstrap")?;
             apply_raw_to_store(&store, &accts, UpdateSource::Rpc);
         }
-        info!(accounts = store.len(), "bootstrapped from fixtures/demo accounts");
+        info!(accounts = store.len(), "bootstrapped from fixtures (offline CI path)");
     } else {
-        warn!("live RPC bootstrap hook present but not enabled without credentials — using empty store");
+        match HttpJsonRpcTransport::new(&rpc_url) {
+            Ok(transport) => {
+                let boot = JsonRpcBootstrap::new(transport);
+                info!(%rpc_url, "live JSON-RPC bootstrap via reqwest");
+                for owner in [programs::klend(), programs::save(), programs::marginfi()] {
+                    match boot.get_program_accounts(&owner).await {
+                        Ok(accts) => {
+                            apply_raw_to_store(&store, &accts, UpdateSource::Rpc);
+                            info!(owner = %owner, n = accts.len(), "program accounts loaded");
+                        }
+                        Err(e) => warn!(error = %e, owner = %owner, "getProgramAccounts failed"),
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "RPC transport unavailable — falling back to fixtures");
+                let boot = FixtureBootstrap::demo_for_protocols();
+                for owner in [programs::klend(), programs::save(), programs::marginfi()] {
+                    let accts = boot.get_program_accounts(&owner).await?;
+                    apply_raw_to_store(&store, &accts, UpdateSource::Rpc);
+                }
+            }
+        }
     }
+    let _ = live_rpc;
 
     // Prefetch HOT route cache structure (empty quotes OK).
     route_cache.prefetch_hot(
@@ -291,20 +319,31 @@ async fn main() -> anyhow::Result<()> {
                     let opp_json = serde_json::to_string(&opp).unwrap_or_default();
                     info!(%opp_json, "opportunity");
 
-                    // Build protocol-exact instruction lists when feasible (demo keys).
-                    let wire_ixs = build_demo_ixs(meta.protocol, best.strategy);
+                    // Structured accounts from borrower key (fixtures/config shaped), not inside builders.
+                    let plan_accounts = PlanAccountSet::from_seed(hit.account);
+                    let swap_blob = JupiterQuoteBlob::from_env();
+                    let amount = borrower.map(|b| b.plan.repay_amount).unwrap_or(1_000_000);
+                    let planned = build_strategy_ixs(
+                        meta.protocol,
+                        best.strategy,
+                        &plan_accounts,
+                        amount,
+                        &swap_blob,
+                    );
+                    let wire_ixs = planned.labeled;
+                    let envelope_b64 = shadow_tx_base64(
+                        &wire_ixs.iter().map(|l| l.ix.clone()).collect::<Vec<_>>(),
+                        "11111111111111111111111111111111",
+                    );
                     let prepared = PreparedTx {
                         label: format!("{:?}-{:?}", meta.protocol, best.strategy),
                         protocol: format!("{:?}", meta.protocol),
                         account: format!("{}", hit.account),
                         notional_usd_micro: notional,
                         expected_profit_usd_micro: best.net_profit_usd_micro,
-                        wire: vec![],
+                        wire: envelope_b64.into_bytes(),
                         ixs: labels,
-                        instructions: wire_ixs
-                            .iter()
-                            .map(|l| l.ix.clone())
-                            .collect(),
+                        instructions: wire_ixs.iter().map(|l| l.ix.clone()).collect(),
                         funding_strategy: Some(best.strategy.as_str().to_string()),
                     };
 
@@ -312,9 +351,26 @@ async fn main() -> anyhow::Result<()> {
                         info!(
                             strategy = best.strategy.as_str(),
                             ixs = prepared.instructions.len(),
+                            flash_builder = planned.used_flash_builder,
+                            swap_incomplete = planned.swap_incomplete,
                             accepted = matches!(best.decision, ProfitDecision::Accept { .. }),
-                            "DRY_RUN: planned liquidation (no submit)"
+                            "DRY_RUN/shadow: planned liquidation (no broadcast)"
                         );
+                        // Optional simulate via RPC when configured (sigVerify=false); never broadcast.
+                        if rpc_url_configured(&rpc_url) {
+                            if let Ok(transport) = HttpJsonRpcTransport::new(&rpc_url) {
+                                let boot = JsonRpcBootstrap::new(transport);
+                                let b64 = String::from_utf8_lossy(&prepared.wire);
+                                match boot.simulate_transaction(&b64, false).await {
+                                    Ok(sim) => info!(
+                                        err = ?sim.err,
+                                        units = ?sim.units_consumed,
+                                        "shadow simulateTransaction (sigVerify=false)"
+                                    ),
+                                    Err(e) => info!(error = %e, "simulate skipped/failed"),
+                                }
+                            }
+                        }
                     } else {
                         match exec.execute(&prepared, 0).await {
                             Ok(res) => info!(?res, "submit result"),
@@ -341,126 +397,3 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn build_demo_ixs(protocol: Protocol, strategy: FundingStrategy) -> Vec<liq_core::LabeledIx> {
-    match (protocol, strategy) {
-        (Protocol::Save, FundingStrategy::SaveFlashLoan) => {
-            let pk = |i| Pubkey::test(70, i);
-            let accounts = liq_save::SaveFlashPlanAccounts {
-                flash_borrow: liq_save::FlashBorrowAccounts {
-                    source_liquidity: pk(1),
-                    destination_liquidity: pk(2),
-                    reserve: pk(3),
-                    lending_market: pk(4),
-                    lending_market_authority: pk(5),
-                },
-                liquidate: liq_save::SaveLiquidateAccounts {
-                    source_liquidity: pk(2),
-                    destination_collateral: pk(10),
-                    destination_liquidity: pk(11),
-                    repay_reserve: pk(3),
-                    repay_reserve_liquidity_supply: pk(12),
-                    withdraw_reserve: pk(13),
-                    withdraw_reserve_collateral_mint: pk(14),
-                    withdraw_reserve_collateral_supply: pk(15),
-                    withdraw_reserve_liquidity_supply: pk(16),
-                    withdraw_reserve_fee_receiver: pk(17),
-                    obligation: pk(18),
-                    lending_market: pk(4),
-                    lending_market_authority: pk(5),
-                    user_transfer_authority: pk(19),
-                },
-                flash_repay: liq_save::FlashRepayAccounts {
-                    source_liquidity: pk(2),
-                    destination_liquidity: pk(1),
-                    fee_receiver: pk(20),
-                    host_fee_receiver: pk(21),
-                    reserve: pk(3),
-                    lending_market: pk(4),
-                    user_transfer_authority: pk(19),
-                },
-                refresh_reserves: vec![pk(3), pk(13)],
-                obligation: pk(18),
-            };
-            liq_save::build_flash_atomic_plan(&accounts, 1_000_000, &[], 400_000, 1_000).labeled
-        }
-        (Protocol::Kamino, FundingStrategy::KaminoFlashBorrow)
-        | (Protocol::Kamino, FundingStrategy::Inventory) => {
-            // Minimal refresh+liquidate labels via inventory builder would need full LiquidateV2Accounts;
-            // emit compute budget + refresh data as proof of non-empty builders.
-            vec![
-                liq_core::LabeledIx {
-                    label: "ComputeBudget:SetComputeUnitLimit".into(),
-                    ix: liq_core::compute_unit_limit(400_000),
-                },
-                liq_core::LabeledIx {
-                    label: "refresh_reserve".into(),
-                    ix: liq_core::Instruction::new(
-                        programs::klend(),
-                        vec![liq_core::AccountMeta::new(Pubkey::test(1, 5), false)],
-                        liq_kamino::encode_refresh_reserve(),
-                    ),
-                },
-                liq_core::LabeledIx {
-                    label: "liquidate_v2".into(),
-                    ix: liq_core::Instruction::new(
-                        programs::klend(),
-                        vec![liq_core::AccountMeta::new_readonly(Pubkey::test(1, 1), true)],
-                        liq_kamino::encode_liquidate_v2_data(1_000, 0, 0),
-                    ),
-                },
-            ]
-        }
-        (Protocol::Project0, FundingStrategy::Project0Receivership) => {
-            use liq_project0::*;
-            let pk = |i| Pubkey::test(8, i);
-            let params = ReceivershipBuildParams {
-                start: StartLiquidationAccounts {
-                    marginfi_account: pk(1),
-                    liquidation_record: pk(2),
-                    group: pk(3),
-                    liquidation_receiver: pk(4),
-                    instruction_sysvar: programs::sysvar_instructions(),
-                    remaining_writable: vec![pk(5)],
-                },
-                withdraw: WithdrawAccounts {
-                    group: pk(3),
-                    marginfi_account: pk(4),
-                    authority: pk(4),
-                    bank: pk(5),
-                    vault: pk(7),
-                    destination: pk(8),
-                    bank_liquidity_vault_authority: pk(9),
-                    token_program: programs::token(),
-                },
-                repay: RepayAccounts {
-                    group: pk(3),
-                    marginfi_account: pk(4),
-                    authority: pk(4),
-                    bank: pk(6),
-                    signer_token_account: pk(10),
-                    vault: pk(11),
-                    token_program: programs::token(),
-                },
-                end: EndLiquidationAccounts {
-                    marginfi_account: pk(1),
-                    liquidation_record: pk(2),
-                    group: pk(3),
-                    liquidation_receiver: pk(4),
-                    fee_state: pk(12),
-                    global_fee_wallet: pk(13),
-                    system_program: programs::system(),
-                    fee_payer: None,
-                },
-                withdraw_amount: 1_000,
-                repay_amount: 900,
-                cu_limit: 500_000,
-                cu_price: 1000,
-            };
-            build_receivership_tx(&params, &[])
-        }
-        _ => vec![liq_core::LabeledIx {
-            label: "ComputeBudget:SetComputeUnitLimit".into(),
-            ix: liq_core::compute_unit_limit(200_000),
-        }],
-    }
-}

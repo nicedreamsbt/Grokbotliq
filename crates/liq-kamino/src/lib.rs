@@ -4,12 +4,14 @@
 //! Full IDL vendored at `idls/klend.json` (sha256 in PROTOCOL_RESEARCH.md).
 
 mod accounts;
+mod decode;
 mod flash;
 mod refresh;
 mod scope;
 mod tx_builder;
 
 pub use accounts::*;
+pub use decode::*;
 pub use flash::*;
 pub use refresh::*;
 pub use scope::*;

@@ -4,21 +4,57 @@ Stream-first Solana liquidation bot. Design target: sub-slot reaction from oracl
 
 ## Design principles
 
-1. **Stream first, poll second** — Geyser (Yellowstone) account + slot updates are the source of truth; RPC is for bootstrap, simulation, and fallback.
+1. **Stream first, poll second** — Geyser (Yellowstone) when live; **RPC bootstrap + poll/fixtures** is the working path today.
 2. **Local health** — maintain a decoded state store; never wait on RPC to decide if an account is liquidatable after a price tick.
 3. **Precompute** — keep partially built transactions (account metas, LUTs, refresh ixs) warm for HOT/CRITICAL candidates.
 4. **Profit gates before submit** — configurable min USD profit, min ROI, gas/tip budget, inventory constraints.
 5. **Circuit breakers** — halt on oracle staleness, error storms, inventory breach, or global pause signals.
 6. **FundingStrategy selection** — evaluate Inventory / flash / receivership paths; pick max EV among feasible Accept decisions.
+7. **Shadow-mode boundary** — real decode/build/simulate; **never broadcast** when `DRY_RUN` or shadow.
+
+## Shadow-mode boundary
+
+```
+                    +------------------------------------------+
+                    |           SHADOW / DRY_RUN               |
+                    |  (signed-but-not-broadcast OR unsigned   |
+                    |   + simulateTransaction sigVerify=false) |
+                    +--------------------+---------------------+
+                                         |
+     real path below                     |     never crosses ↓
+                                         v
++-------------+   +--------------+   +-----------+   +----------------+
+| RPC URL     |-->| HttpJsonRpc  |-->| Decode    |-->| Health / index |
+| or FIXTURES |   | Transport    |   | (planning |   | FundingStrategy|
++-------------+   | (reqwest)    |   |  layouts) |   +--------+-------+
+                  +------+-------+   +-----------+            |
+                         |                                      v
+                         |                            +------------------+
+                         |                            | Tx builder       |
+                         |                            | (flash/inventory |
+                         |                            |  + optional swap |
+                         |                            |  from quote blob)|
+                         |                            +--------+---------+
+                         |                                      |
+                         |                                      v
+                         |                            +------------------+
+                         +--------------------------->| simulateTransaction|
+                                                      | NO sendTransaction|
+                                                      | NO Jito broadcast |
+                                                      +------------------+
+
+Live submit (Jito/TPU) stays behind ExecConfig.dry_run=false + credentials;
+forced live without wiring returns an error.
+```
 
 ## Pipeline
 
 ```
-Geyser / Yellowstone gRPC  (or fixtures / MockGeyser)
+Geyser / Yellowstone gRPC  (stub)  OR  fixtures / MockGeyser  OR  RPC poll
         |
         v
 +------------------+
-| Account decoder  |  -- protocol adapters (Kamino / P0 / Save)
+| Account decoder  |  -- protocol adapters (Kamino planning decode / P0 / Save)
 +------------------+
         |
         v
@@ -27,7 +63,6 @@ Geyser / Yellowstone gRPC  (or fixtures / MockGeyser)
 +------------------+
         |
         +---> CandidateIndex (CRITICAL/HOT/WARM/COLD)
-        |         +-- per-asset BTreeMap price-trigger indexes
         |
         v
 Oracle price update ----> trigger crossing scan ----> local health recompute
@@ -35,14 +70,14 @@ Oracle price update ----> trigger crossing scan ----> local health recompute
         v
 FundingPathEnumerator  (Inventory | SaveFlash | KaminoFlash | P0Receivership)
         |
-        +-- swap cost (SwapRouter) + flash fee + tip modeled
-        +-- score ≈ net_profit × landing_prob / latency  (ROI via capital gate)
+        v
+Protocol-exact Tx builder
+  KaminoFlashBorrow → build_flash_tx()
+  SaveFlashLoan     → build_flash_atomic_plan()
+  Inventory         → non-flash builder
         |
         v
-Protocol-exact Tx builder (CU + refresh + liquidate [+ flash wrap] [+ swap])
-        |
-        v
-Execution (DRY_RUN log | Jito bundle / TPU / RPC send) + Telemetry
+Shadow: simulateTransaction  |  Live: Jito/TPU (unwired)  + Telemetry
 ```
 
 ## FundingStrategy
@@ -88,12 +123,12 @@ Execution (DRY_RUN log | Jito bundle / TPU / RPC send) + Telemetry
 | Crate | Responsibility |
 |-------|----------------|
 | `liq-core` | StateStore, CandidateIndex, profitability, FundingStrategy, Instruction |
-| `liq-streaming` | Geyser trait, mock, failover, Yellowstone stubs, fixtures, RPC bootstrap |
-| `liq-kamino` | Klend health + flash + tx_builder |
+| `liq-streaming` | Geyser trait, mock, failover, Yellowstone stubs, fixtures, **reqwest RPC** |
+| `liq-kamino` | Klend health + flash + tx_builder + planning decode |
 | `liq-project0` | Classic + receivership wire builders |
 | `liq-save` | Save health + flash atomic plan |
-| `liq-execution` | Tx submit + opportunity JSON |
-| `liq-routing` | SwapRouter + route cache |
+| `liq-execution` | Tx submit + opportunity JSON + **strategy planner** |
+| `liq-routing` | SwapRouter + JupiterQuoteBlob + route cache |
 | `liq-risk` | Limits + circuit breaker |
 | `liq-telemetry` | Prometheus-compatible metric types |
 
@@ -101,8 +136,8 @@ Execution (DRY_RUN log | Jito bundle / TPU / RPC send) + Telemetry
 
 | Bin | Role |
 |-----|------|
-| `liquidator` | Bootstrap → stream → funding plans → dry-run / submit |
-| `shadow` | Observe + log would-be liquidations without submit |
+| `liquidator` | Bootstrap → stream → funding plans → dry-run / simulate |
+| `shadow` | Observe + build ixs + simulate; never sign/broadcast |
 | `replay` | Replay recorded Geyser fixtures through the pipeline |
 | `bench` | Microbench index / health / profitability |
 
@@ -112,7 +147,7 @@ See `config/example.toml` and `config/example.env`. **DRY_RUN=true** by default.
 
 ## Remaining gaps (honest)
 
-- Live Yellowstone gRPC client (trait + stub compile without creds)
-- Full IDL-accurate zero-copy account decode
+- Live Yellowstone gRPC client (RPC is the real bootstrap path)
+- Full IDL-accurate zero-copy account decode (planning fixture decode for Kamino only)
 - Production Jito auth + VersionedTransaction signing
-- Live reserve flash-fee reads; re-verify Save tags 19/20 and Kamino flash discs on mainnet
+- Live reserve flash-fee reads; Save tag 19/20 mainnet re-verify

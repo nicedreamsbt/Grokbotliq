@@ -4,8 +4,12 @@
 //! (optional swap) → FlashRepayReserveLiquidity (tag 20).
 //! Legacy path: FlashLoan tag 13 (deprecated CPI-receiver style) — kept for research.
 //!
-//! Layouts from vendored `idls/solend_sdk_0.1.0_instruction.rs`. Verification TODO:
-//! confirm Save mainnet still uses the same tags (19/20) before live submit.
+//! Layouts from vendored `idls/solend_sdk_0.1.0_instruction.rs`.
+//! Writable/readonly flags reconciled against solend-sdk 0.1.0 helpers
+//! (`flash_borrow_reserve_liquidity`, `flash_repay_reserve_liquidity`,
+//! `liquidate_obligation_and_redeem_reserve_collateral`) — see meta flag tests.
+//! Remaining uncertainty: Save mainnet tag 19/20 re-verify before live submit
+//! (documented in PROTOCOL_RESEARCH.md).
 
 use crate::{encode_liquidate_and_redeem, encode_refresh_obligation, encode_refresh_reserve, SaveIx};
 use liq_core::{
@@ -366,5 +370,51 @@ mod tests {
     fn legacy_flash_loan_tag_13() {
         let d = encode_flash_loan_legacy(99);
         assert_eq!(d[0], 13);
+    }
+
+    #[test]
+    fn flash_borrow_meta_writable_flags_match_solend_sdk() {
+        let a = sample_accounts().flash_borrow;
+        let m = a.metas();
+        assert_eq!(m.len(), 7);
+        // source, dest, reserve writable; market, authority, sysvar, token readonly
+        assert!(m[0].is_writable && !m[0].is_signer);
+        assert!(m[1].is_writable);
+        assert!(m[2].is_writable);
+        assert!(!m[3].is_writable); // lending_market
+        assert!(!m[4].is_writable); // lending_market_authority
+        assert!(!m[5].is_writable); // instructions
+        assert!(!m[6].is_writable); // token
+    }
+
+    #[test]
+    fn flash_repay_meta_writable_flags_match_solend_sdk() {
+        let a = sample_accounts().flash_repay;
+        let m = a.metas();
+        assert_eq!(m.len(), 9);
+        assert!(m[0].is_writable);
+        assert!(m[1].is_writable);
+        assert!(m[2].is_writable); // fee_receiver
+        assert!(m[3].is_writable); // host_fee_receiver
+        assert!(m[4].is_writable); // reserve
+        assert!(!m[5].is_writable); // lending_market
+        assert!(!m[6].is_writable && m[6].is_signer); // user authority
+        assert!(!m[7].is_writable);
+        assert!(!m[8].is_writable);
+    }
+
+    #[test]
+    fn liquidate_meta_writable_flags_match_solend_sdk() {
+        let a = sample_accounts().liquidate;
+        let m = a.metas();
+        assert_eq!(m.len(), 15);
+        // first 11 writable per SDK; market, authority, user(signer), token readonly
+        for i in 0..11 {
+            assert!(m[i].is_writable, "idx {i} should be writable");
+        }
+        assert!(!m[11].is_writable); // lending_market
+        assert!(!m[12].is_writable); // authority
+        assert!(!m[13].is_writable && m[13].is_signer);
+        assert!(!m[14].is_writable); // token
     }
 }
