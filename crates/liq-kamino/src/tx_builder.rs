@@ -86,68 +86,55 @@ fn ensure_ata_ixs(params: &KaminoTxBuildParams) -> Vec<LabeledIx> {
     out
 }
 
-fn refresh_ixs(params: &KaminoTxBuildParams) -> Vec<LabeledIx> {
-    let mut out = Vec::new();
-    let mut seen = Vec::new();
-    let market = params.liquidate.lending_market;
+fn fix_oracle_pubkey(pk: Pubkey) -> Pubkey {
     // Klend expects program id (not system/default) for unused oracle slots.
-    let fix_oracle = |pk: Pubkey| {
-        if pk.0 == [0u8; 32] {
-            programs::klend()
-        } else {
-            pk
-        }
-    };
-    if !params.refresh_reserves.is_empty() {
-        for rr in &params.refresh_reserves {
-            if seen.contains(&rr.reserve) {
-                continue;
-            }
-            seen.push(rr.reserve);
-            out.push(LabeledIx {
-                label: "refresh_reserve".into(),
-                ix: Instruction::new(
-                    programs::klend(),
-                    vec![
-                        AccountMeta::new(rr.reserve, false),
-                        AccountMeta::new_readonly(rr.lending_market, false),
-                        AccountMeta::new_readonly(fix_oracle(rr.pyth_oracle), false),
-                        AccountMeta::new_readonly(fix_oracle(rr.switchboard_price), false),
-                        AccountMeta::new_readonly(fix_oracle(rr.switchboard_twap), false),
-                        AccountMeta::new_readonly(fix_oracle(rr.scope_prices), false),
-                    ],
-                    encode_refresh_reserve(),
-                ),
-            });
-        }
+    if pk.0 == [0u8; 32] {
+        programs::klend()
     } else {
-        for r in params
-            .deposit_reserves
-            .iter()
-            .chain(params.borrow_reserves.iter())
-        {
-            if seen.contains(r) {
-                continue;
-            }
-            seen.push(*r);
-            // Minimal fallback (will fail AccountNotEnoughKeys on-chain until refresh_reserves filled).
-            out.push(LabeledIx {
-                label: "refresh_reserve".into(),
-                ix: Instruction::new(
-                    programs::klend(),
-                    vec![
-                        AccountMeta::new(*r, false),
-                        AccountMeta::new_readonly(market, false),
-                        AccountMeta::new_readonly(programs::klend(), false),
-                        AccountMeta::new_readonly(programs::klend(), false),
-                        AccountMeta::new_readonly(programs::klend(), false),
-                        AccountMeta::new_readonly(programs::klend(), false),
-                    ],
-                    encode_refresh_reserve(),
-                ),
-            });
-        }
+        pk
     }
+}
+
+/// Build a single `refresh_reserve` ix for `reserve`, using `refresh_reserves` oracle metas when present.
+fn refresh_reserve_ix(params: &KaminoTxBuildParams, reserve: Pubkey) -> LabeledIx {
+    let market = params.liquidate.lending_market;
+    if let Some(rr) = params.refresh_reserves.iter().find(|r| r.reserve == reserve) {
+        return LabeledIx {
+            label: "refresh_reserve".into(),
+            ix: Instruction::new(
+                programs::klend(),
+                vec![
+                    AccountMeta::new(rr.reserve, false),
+                    AccountMeta::new_readonly(rr.lending_market, false),
+                    AccountMeta::new_readonly(fix_oracle_pubkey(rr.pyth_oracle), false),
+                    AccountMeta::new_readonly(fix_oracle_pubkey(rr.switchboard_price), false),
+                    AccountMeta::new_readonly(fix_oracle_pubkey(rr.switchboard_twap), false),
+                    AccountMeta::new_readonly(fix_oracle_pubkey(rr.scope_prices), false),
+                ],
+                encode_refresh_reserve(),
+            ),
+        };
+    }
+    // Minimal fallback (will fail AccountNotEnoughKeys on-chain until refresh_reserves filled).
+    LabeledIx {
+        label: "refresh_reserve".into(),
+        ix: Instruction::new(
+            programs::klend(),
+            vec![
+                AccountMeta::new(reserve, false),
+                AccountMeta::new_readonly(market, false),
+                AccountMeta::new_readonly(programs::klend(), false),
+                AccountMeta::new_readonly(programs::klend(), false),
+                AccountMeta::new_readonly(programs::klend(), false),
+                AccountMeta::new_readonly(programs::klend(), false),
+            ],
+            encode_refresh_reserve(),
+        ),
+    }
+}
+
+fn refresh_obligation_ix(params: &KaminoTxBuildParams, seen_reserves: &[Pubkey]) -> LabeledIx {
+    let market = params.liquidate.lending_market;
     // refresh_obligation remaining accounts (klend handler):
     //   deposits (slot order) + borrows (slot order)
     //   [+ ReferrerTokenState per borrow when has_referrer]
@@ -164,21 +151,73 @@ fn refresh_ixs(params: &KaminoTxBuildParams) -> Vec<LabeledIx> {
     }
     // Fallback if deposit/borrow lists empty but we refreshed something.
     if pushed == 0 {
-        for r in &seen {
+        for r in seen_reserves {
             obl_metas.push(AccountMeta::new(*r, false));
         }
     }
     for rts in &params.referrer_token_states {
         obl_metas.push(AccountMeta::new(*rts, false));
     }
-    out.push(LabeledIx {
+    LabeledIx {
         label: "refresh_obligation".into(),
         ix: Instruction::new(
             programs::klend(),
             obl_metas,
             encode_refresh_obligation(),
         ),
-    });
+    }
+}
+
+fn unique_refresh_reserve_keys(params: &KaminoTxBuildParams) -> Vec<Pubkey> {
+    let mut seen = Vec::new();
+    if !params.refresh_reserves.is_empty() {
+        for rr in &params.refresh_reserves {
+            if !seen.contains(&rr.reserve) {
+                seen.push(rr.reserve);
+            }
+        }
+    } else {
+        for r in params
+            .deposit_reserves
+            .iter()
+            .chain(params.borrow_reserves.iter())
+        {
+            if !seen.contains(r) {
+                seen.push(*r);
+            }
+        }
+    }
+    seen
+}
+
+fn refresh_ixs(params: &KaminoTxBuildParams) -> Vec<LabeledIx> {
+    let seen = unique_refresh_reserve_keys(params);
+    let mut out: Vec<_> = seen.iter().map(|r| refresh_reserve_ix(params, *r)).collect();
+    out.push(refresh_obligation_ix(params, &seen));
+    out
+}
+
+/// Post-`flash_borrow` refreshes required before `liquidate_v2`.
+///
+/// `flash_borrow_reserve_liquidity` mutates the flash/repay reserve and calls
+/// `last_update.mark_stale()`, so liquidate hits Custom 6009 ReserveStale unless
+/// that reserve is refreshed again in the same slot. Matches klend-sdk
+/// `inBetweenIxs` (refresh reserves + refresh_obligation between lending ixs).
+fn post_flash_refresh_ixs(params: &KaminoTxBuildParams, flash_reserve: Pubkey) -> Vec<LabeledIx> {
+    let mut out = Vec::new();
+    let mut refreshed = Vec::new();
+    // Always refresh the flash/repay reserve (the one marked stale).
+    out.push(refresh_reserve_ix(params, flash_reserve));
+    refreshed.push(flash_reserve);
+    // Also refresh withdraw reserve when distinct — liquidate checks both.
+    let withdraw = params.liquidate.withdraw_reserve;
+    if withdraw != flash_reserve && !refreshed.contains(&withdraw) {
+        out.push(refresh_reserve_ix(params, withdraw));
+        refreshed.push(withdraw);
+    }
+    // Obligation was refreshed pre-flash and flash does not mark it stale, but
+    // klend-sdk re-refreshes between lending ixs; keep that pattern.
+    out.push(refresh_obligation_ix(params, &refreshed));
     out
 }
 
@@ -227,7 +266,11 @@ pub fn build_inventory_tx(params: &KaminoTxBuildParams, swaps: &[LabeledIx]) -> 
     ixs
 }
 
-/// Flash path: CU → refresh → CreateIdempotent ATAs → flash_borrow → liquidate_v2 → swaps → flash_repay.
+/// Flash path: CU → refresh → CreateIdempotent ATAs → flash_borrow
+/// → refresh_reserve(repay[+withdraw]) → refresh_obligation → liquidate_v2 → swaps → flash_repay.
+///
+/// `borrow_instruction_index` is the index of flash_borrow in the final list (ATAs
+/// and pre-flash refreshes shift it; post-flash refreshes do not).
 pub fn build_flash_tx(params: &KaminoTxBuildParams, swaps: &[LabeledIx]) -> Option<Vec<LabeledIx>> {
     let (borrow_acc, repay_acc) = params.flash.as_ref()?;
     let mut ixs = vec![
@@ -248,6 +291,8 @@ pub fn build_flash_tx(params: &KaminoTxBuildParams, swaps: &[LabeledIx]) -> Opti
         label: "flash_borrow_reserve_liquidity".into(),
         ix: borrow_acc.build_ix(params.liquidity_amount),
     });
+    // flash_borrow marks repay reserve stale → refresh before liquidate (Custom 6009).
+    ixs.extend(post_flash_refresh_ixs(params, borrow_acc.reserve));
     ixs.push(liquidate_ix(params));
     ixs.extend(swaps.iter().cloned());
     ixs.push(LabeledIx {
@@ -463,5 +508,98 @@ mod flash_builder_tests {
         let create = &ixs[create_pos];
         assert_eq!(create.ix.program_id, programs::associated_token());
         assert_eq!(create.ix.data, vec![1u8]);
+    }
+
+    #[test]
+    fn flash_plan_refreshes_repay_after_borrow_before_liquidate_and_index_math() {
+        let (b, r) = sample_flash();
+        let flash_reserve = Pubkey::test(1, 5);
+        let withdraw = Pubkey::test(1, 8);
+        let payer = Pubkey::test(3, 1);
+        let ensure = vec![
+            EnsureAta {
+                payer,
+                owner: payer,
+                mint: Pubkey::test(1, 6),
+                token_program: programs::token(),
+            },
+            EnsureAta {
+                payer,
+                owner: payer,
+                mint: Pubkey::test(1, 10),
+                token_program: programs::token(),
+            },
+        ];
+        let params = KaminoTxBuildParams {
+            obligation: Pubkey::test(1, 2),
+            deposit_reserves: vec![withdraw],
+            borrow_reserves: vec![flash_reserve],
+            liquidate: sample_liq(),
+            liquidity_amount: 1_000,
+            min_acceptable_received: 0,
+            max_allowed_ltv_override_percent: 0,
+            cu_limit: 400_000,
+            cu_price: 1000,
+            flash: Some((b, r)),
+            refresh_reserves: vec![
+                RefreshReserveAccounts {
+                    reserve: flash_reserve,
+                    lending_market: Pubkey::test(1, 3),
+                    pyth_oracle: Pubkey::default(),
+                    switchboard_price: Pubkey::default(),
+                    switchboard_twap: Pubkey::default(),
+                    scope_prices: Pubkey::default(),
+                },
+                RefreshReserveAccounts {
+                    reserve: withdraw,
+                    lending_market: Pubkey::test(1, 3),
+                    pyth_oracle: Pubkey::default(),
+                    switchboard_price: Pubkey::default(),
+                    switchboard_twap: Pubkey::default(),
+                    scope_prices: Pubkey::default(),
+                },
+            ],
+            referrer_token_states: vec![],
+            ensure_atas: ensure,
+        };
+        let ixs = build_flash_tx(&params, &[]).expect("flash");
+        let labels: Vec<_> = ixs.iter().map(|l| l.label.as_str()).collect();
+
+        let borrow_pos = labels
+            .iter()
+            .position(|l| *l == "flash_borrow_reserve_liquidity")
+            .unwrap();
+        let liq_pos = labels
+            .iter()
+            .position(|l| l.contains("liquidate"))
+            .unwrap();
+        let repay_pos = labels
+            .iter()
+            .position(|l| *l == "flash_repay_reserve_liquidity")
+            .unwrap();
+
+        // Between flash_borrow and liquidate: refresh_reserve(+withdraw) then refresh_obligation.
+        let between: Vec<_> = labels[borrow_pos + 1..liq_pos].to_vec();
+        assert!(
+            between.iter().any(|l| *l == "refresh_reserve"),
+            "expected post-flash refresh_reserve before liquidate, got {between:?}"
+        );
+        assert_eq!(
+            between.last().copied(),
+            Some("refresh_obligation"),
+            "post-flash refresh_obligation must immediately precede liquidate"
+        );
+        assert!(borrow_pos < liq_pos && liq_pos < repay_pos);
+
+        // flash_repay borrow_instruction_index == flash_borrow index (ATAs shift it; post-flash does not).
+        let repay = &ixs[repay_pos];
+        assert_eq!(*repay.ix.data.last().unwrap(), borrow_pos as u8);
+
+        // Pre-flash CreateIdempotent still before borrow.
+        let create_pos = labels
+            .iter()
+            .position(|l| l.contains("CreateIdempotent"))
+            .unwrap();
+        assert!(create_pos < borrow_pos);
     }
 }

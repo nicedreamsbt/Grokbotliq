@@ -582,10 +582,27 @@ async fn run_fixture_shadow(fixtures_arg: Option<String>) -> anyhow::Result<()> 
 
 fn summarize_kamino_sim_progress(simulate_results: &[serde_json::Value]) -> String {
     let mut best = "Kamino shadow: no strategy sims".to_string();
-    for s in simulate_results {
-        if s.get("protocol").and_then(|p| p.as_str()) != Some("Kamino") {
-            continue;
+    // Prefer sims that reached on-chain InstructionError over RPC encode/size failures.
+    let mut kamino: Vec<&serde_json::Value> = simulate_results
+        .iter()
+        .filter(|s| s.get("protocol").and_then(|p| p.as_str()) == Some("Kamino"))
+        .collect();
+    kamino.sort_by_key(|s| {
+        let err = s.get("err");
+        let has_ix_err = err
+            .map(|e| !e.is_null() && e.to_string().contains("InstructionError"))
+            .unwrap_or(false);
+        let ok = s.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+        // ok first, then InstructionError, then others
+        if ok {
+            0
+        } else if has_ix_err {
+            1
+        } else {
+            2
         }
+    });
+    for s in kamino {
         let ok = s.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
         let units = s
             .get("units_consumed")
@@ -615,7 +632,15 @@ fn summarize_kamino_sim_progress(simulate_results: &[serde_json::Value]) -> Stri
         }
         // Prefer concrete InstructionError
         let err_s = err.to_string();
+        if err.is_null() || err_s == "null" {
+            // e.g. vtx too large — keep scanning for a better sample
+            best = format!(
+                "Kamino progress: sim without InstructionError (rpc/encode); notes={labels_hint}; units={units}"
+            );
+            continue;
+        }
         let past_3012 = !err_s.contains("3012");
+        let past_6009 = !err_s.contains("6009");
         let create_seen = logs.iter().any(|l| {
             l.as_str()
                 .map(|t| t.contains("CreateIdempotent") || t.contains("Associated Token"))
@@ -630,12 +655,17 @@ fn summarize_kamino_sim_progress(simulate_results: &[serde_json::Value]) -> Stri
             } else if err_s.contains("6017") {
                 "Custom 6017 ObligationStale"
             } else if err_s.contains("6016") {
-                "Custom 6016 ObligationHealthy"
+                "Custom 6016 ObligationHealthy (candidate selection/health decode — flash+refresh path past ReserveStale)"
             } else {
                 "see err"
             };
+            let cleared = if past_6009 && !err_s.contains("6009") {
+                "past 3012 AccountNotInitialized and 6009 ReserveStale"
+            } else {
+                "past liquidate AccountNotInitialized (3012)"
+            };
             return format!(
-                "Kamino progress: past liquidate AccountNotInitialized (3012); next={named}; raw={err_s}; units={units}"
+                "Kamino progress: {cleared}; next={named}; raw={err_s}; units={units}"
             );
         }
     }
