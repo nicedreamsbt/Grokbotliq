@@ -46,6 +46,7 @@ bytes = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 bs58 = "0.5"
 base64 = "0.22"
+futures = "0.3"
 
 # PDA / ATA derivation (no solana-sdk)
 sha2 = "0.10"
