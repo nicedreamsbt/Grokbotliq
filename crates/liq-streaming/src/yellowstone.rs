@@ -22,11 +22,18 @@ use {
 };
 
 /// Env / config knobs expected for a live Yellowstone connection.
+///
+/// ## Alchemy Example
+/// ```bash
+/// export GEYSER_ENDPOINT="https://solana-mainnet.streaming.alchemy.com"
+/// export GEYSER_X_TOKEN="your-alchemy-api-key"
+/// export GEYSER_COMMITMENT="processed"  # optional, defaults to "processed"
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct YellowstoneConfig {
-    /// e.g. `https://grpc.example.com:443`
+    /// gRPC endpoint (e.g., `https://solana-mainnet.streaming.alchemy.com`)
     pub endpoint: String,
-    /// `x-token` (or provider-specific) auth header value.
+    /// `x-token` auth header (Alchemy API key or provider-specific token). NEVER logged.
     pub x_token: Option<String>,
     /// Commitment for account/slot subscriptions.
     #[serde(default = "default_commitment")]
@@ -73,10 +80,17 @@ impl YellowstoneConfig {
 
 /// Real Yellowstone gRPC subscriber (when feature enabled + credentials present).
 ///
-/// Integration:
+/// ## Integration Path
 /// 1. Maps [`SubscribeFilter`] → `SubscribeRequest` (accounts / owners / slots + datasize).
 /// 2. Translates `SubscribeUpdate` → [`StreamEvent`] (Account / Slot).
-/// 3. Klend-specific datasize filters: obligations=3344, reserves=8624.
+/// 3. Returns `mpsc::Receiver<StreamEvent>` consumed by liquidator ingest loop.
+/// 4. **TODO(StreamDetectionPath)**: When detection.rs / HotPathCache seam merges,
+///    wire receiver into `StreamDetectionPath::ingest()` instead of direct loop.
+///
+/// ## Klend Filters
+/// - Owner: `KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD`
+/// - Obligations datasize: 3344 bytes
+/// - Reserves datasize: 8624 bytes
 #[derive(Debug, Clone)]
 pub struct YellowstoneSubscriber {
     pub config: YellowstoneConfig,
@@ -304,6 +318,11 @@ mod tests {
 
     #[test]
     fn config_from_env_ignores_placeholders() {
+        // Clean any existing env vars first
+        std::env::remove_var("GEYSER_ENDPOINT");
+        std::env::remove_var("GEYSER_X_TOKEN");
+        std::env::remove_var("GEYSER_COMMITMENT");
+        
         std::env::set_var("GEYSER_ENDPOINT", "https://YOUR_GEYSER_GRPC");
         assert!(YellowstoneConfig::from_env().is_none());
         std::env::set_var("GEYSER_ENDPOINT", "https://grpc.example.test:443");
@@ -333,5 +352,28 @@ mod tests {
         // Verify constants match discovery.rs / kamino decode.rs
         assert_eq!(3344, crate::discovery::known::KLEND_OBLIGATION_DATASIZE);
         assert_eq!(8624, crate::discovery::known::KLEND_RESERVE_DATASIZE);
+    }
+
+    #[test]
+    fn alchemy_endpoint_config() {
+        std::env::set_var("GEYSER_ENDPOINT", "https://solana-mainnet.streaming.alchemy.com");
+        std::env::set_var("GEYSER_X_TOKEN", "test-alchemy-key-123");
+        std::env::set_var("GEYSER_COMMITMENT", "confirmed");
+        
+        let cfg = YellowstoneConfig::from_env().expect("config should load");
+        assert_eq!(cfg.endpoint, "https://solana-mainnet.streaming.alchemy.com");
+        assert_eq!(cfg.x_token, Some("test-alchemy-key-123".into()));
+        assert_eq!(cfg.commitment, "confirmed");
+        assert!(cfg.has_credentials());
+        
+        // Verify token is never in debug output via RedactedUrl
+        use crate::redact::RedactedUrl;
+        let redacted = format!("{}", RedactedUrl(&cfg.endpoint));
+        assert_eq!(redacted, "https://solana-mainnet.streaming.alchemy.com");
+        assert!(!redacted.contains("test-alchemy-key"));
+        
+        std::env::remove_var("GEYSER_ENDPOINT");
+        std::env::remove_var("GEYSER_X_TOKEN");
+        std::env::remove_var("GEYSER_COMMITMENT");
     }
 }
