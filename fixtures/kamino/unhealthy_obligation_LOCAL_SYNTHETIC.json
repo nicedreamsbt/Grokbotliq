@@ -1,0 +1,94 @@
+{
+  "description": "⚠️ LOCAL SYNTHETIC FIXTURE - NOT MAINNET EVIDENCE ⚠️",
+  "warning": "This is a constructed test case based on the unit test 'unhealthy_when_borrow_exceeds_deposit_times_liq_ltv' from live_health.rs:561. It demonstrates what a liquidatable Kamino position would look like. DO NOT cite this as mainnet data.",
+  "source": "Generated from unit test fixtures in crates/liq-kamino/src/live_health.rs",
+  "obligation": {
+    "pubkey": "TEST1111111111111111111111111111111111111111",
+    "protocol": "Kamino",
+    "market": "7u3HeHxYDLhnCoErrtycNokbQYbWGzLs6JSDqGAv5PfF",
+    "owner": "TEST2222222222222222222222222222222222222222",
+    "elevation_group": 0,
+    "has_debt": true,
+    "deposits": [
+      {
+        "reserve": "TEST3333333333333333333333333333333333333333",
+        "deposited_amount": 100000000,
+        "decimals": 6,
+        "mint": "COLL1111111111111111111111111111111111111111",
+        "liquidation_threshold_pct": 60,
+        "loan_to_value_pct": 50,
+        "price_usd": 1.0,
+        "value_usd": 100.0,
+        "unhealthy_borrow_value_contribution_usd": 60.0,
+        "allowed_borrow_value_contribution_usd": 50.0
+      }
+    ],
+    "borrows": [
+      {
+        "reserve": "TEST4444444444444444444444444444444444444444",
+        "borrowed_amount_sf": "76561197960265728000",
+        "borrowed_amount_tokens": 70000000.0,
+        "decimals": 6,
+        "mint": "DEBT1111111111111111111111111111111111111111",
+        "borrow_factor_pct": 100,
+        "price_usd": 1.0,
+        "value_usd": 70.0,
+        "bf_adjusted_debt_usd": 70.0
+      }
+    ]
+  },
+  "computed_health": {
+    "deposited_value_usd": 100.0,
+    "borrowed_value_usd": 70.0,
+    "borrow_factor_adjusted_debt_usd": 70.0,
+    "unhealthy_borrow_value_usd": 60.0,
+    "allowed_borrow_value_usd": 50.0,
+    "health_factor": 0.857,
+    "ltv": 0.70,
+    "is_liquidatable": true,
+    "below_maintenance": true,
+    "reason": "bf_debt ($70) > unhealthy_threshold ($60)"
+  },
+  "explanation": {
+    "why_liquidatable": "The position has $100 collateral with 60% liquidation threshold, meaning it can safely support up to $60 of debt. However, it has borrowed $70, which exceeds the liquidation threshold. Therefore health_factor = 60/70 = 0.857 < 1.0 → LIQUIDATABLE.",
+    "why_below_maintenance": "The position also exceeds the LTV (50%), meaning it cannot borrow more. It is both below_maintenance (> $50 LTV limit) and liquidatable (> $60 liquidation limit).",
+    "typical_reserve_params": {
+      "conservative": {
+        "ltv": "65%",
+        "liquidation_threshold": "75%",
+        "example": "USDC collateral"
+      },
+      "moderate": {
+        "ltv": "50%",
+        "liquidation_threshold": "60%",
+        "example": "Blue-chip altcoins"
+      },
+      "aggressive_elevation_group": {
+        "ltv": "87%",
+        "liquidation_threshold": "92%",
+        "example": "LST/SOL loops (elevation group 2)"
+      }
+    }
+  },
+  "test_usage": {
+    "purpose": "Use this fixture to test liquidate_v2 instruction building, bonus calculations, and flash loan path without requiring mainnet liquidatable positions.",
+    "how_to_use": [
+      "1. Load this fixture in test harness",
+      "2. Build liquidate_v2 instruction with repay_reserve and withdraw_reserve",
+      "3. Calculate expected collateral received: repay_value * (1 + bonus_bps/10000) / withdraw_price",
+      "4. Verify instruction data encoding matches klend-sdk discriminators",
+      "5. (Optional) Simulate transaction with mock RPC returning Custom 6016 when health > 1.0"
+    ]
+  },
+  "mainnet_reality": {
+    "liquidatable_count": 0,
+    "below_maintenance_count": 2423,
+    "interpretation": "As of the shadow report baseline, Kamino mainnet had ZERO liquidatable positions. The 2,423 below_maintenance positions are in the warning zone (between LTV and liquidation threshold) but not actionable for liquidation. This fixture demonstrates a scenario that does NOT currently exist on mainnet.",
+    "when_you_would_find_this": [
+      "Oracle shock (e.g. SOL price drops 20% in 1 hour)",
+      "Borrower intentionally drains collateral below threshold",
+      "Scope oracle goes stale (> 512 slots without refresh)",
+      "Historical event (e.g. FTX collapse, March 2023 USDC depeg)"
+    ]
+  }
+}
