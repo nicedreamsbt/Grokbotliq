@@ -8,6 +8,17 @@ use liq_core::{
 };
 use serde::{Deserialize, Serialize};
 
+/// Optional per-reserve accounts for `refresh_reserve` (market + oracles).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RefreshReserveAccounts {
+    pub reserve: Pubkey,
+    pub lending_market: Pubkey,
+    pub pyth_oracle: Pubkey,
+    pub switchboard_price: Pubkey,
+    pub switchboard_twap: Pubkey,
+    pub scope_prices: Pubkey,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KaminoTxBuildParams {
     pub obligation: Pubkey,
@@ -20,30 +31,85 @@ pub struct KaminoTxBuildParams {
     pub cu_limit: u32,
     pub cu_price: u64,
     pub flash: Option<(FlashBorrowAccounts, FlashRepayAccounts)>,
+    /// When present, refresh_reserve/obligation use full account metas.
+    #[serde(default)]
+    pub refresh_reserves: Vec<RefreshReserveAccounts>,
 }
 
-fn refresh_ixs(obligation: Pubkey, reserves: &[Pubkey]) -> Vec<LabeledIx> {
+fn refresh_ixs(params: &KaminoTxBuildParams) -> Vec<LabeledIx> {
     let mut out = Vec::new();
     let mut seen = Vec::new();
-    for r in reserves {
-        if seen.contains(r) {
-            continue;
+    let market = params.liquidate.lending_market;
+    // Klend expects program id (not system/default) for unused oracle slots.
+    let fix_oracle = |pk: Pubkey| {
+        if pk.0 == [0u8; 32] {
+            programs::klend()
+        } else {
+            pk
         }
-        seen.push(*r);
-        out.push(LabeledIx {
-            label: "refresh_reserve".into(),
-            ix: Instruction::new(
-                programs::klend(),
-                vec![AccountMeta::new(*r, false)],
-                encode_refresh_reserve(),
-            ),
-        });
+    };
+    if !params.refresh_reserves.is_empty() {
+        for rr in &params.refresh_reserves {
+            if seen.contains(&rr.reserve) {
+                continue;
+            }
+            seen.push(rr.reserve);
+            out.push(LabeledIx {
+                label: "refresh_reserve".into(),
+                ix: Instruction::new(
+                    programs::klend(),
+                    vec![
+                        AccountMeta::new(rr.reserve, false),
+                        AccountMeta::new_readonly(rr.lending_market, false),
+                        AccountMeta::new_readonly(fix_oracle(rr.pyth_oracle), false),
+                        AccountMeta::new_readonly(fix_oracle(rr.switchboard_price), false),
+                        AccountMeta::new_readonly(fix_oracle(rr.switchboard_twap), false),
+                        AccountMeta::new_readonly(fix_oracle(rr.scope_prices), false),
+                    ],
+                    encode_refresh_reserve(),
+                ),
+            });
+        }
+    } else {
+        for r in params
+            .deposit_reserves
+            .iter()
+            .chain(params.borrow_reserves.iter())
+        {
+            if seen.contains(r) {
+                continue;
+            }
+            seen.push(*r);
+            // Minimal fallback (will fail AccountNotEnoughKeys on-chain until refresh_reserves filled).
+            out.push(LabeledIx {
+                label: "refresh_reserve".into(),
+                ix: Instruction::new(
+                    programs::klend(),
+                    vec![
+                        AccountMeta::new(*r, false),
+                        AccountMeta::new_readonly(market, false),
+                        AccountMeta::new_readonly(programs::klend(), false),
+                        AccountMeta::new_readonly(programs::klend(), false),
+                        AccountMeta::new_readonly(programs::klend(), false),
+                        AccountMeta::new_readonly(programs::klend(), false),
+                    ],
+                    encode_refresh_reserve(),
+                ),
+            });
+        }
+    }
+    let mut obl_metas = vec![
+        AccountMeta::new_readonly(market, false),
+        AccountMeta::new(params.obligation, false),
+    ];
+    for r in &seen {
+        obl_metas.push(AccountMeta::new(*r, false));
     }
     out.push(LabeledIx {
         label: "refresh_obligation".into(),
         ix: Instruction::new(
             programs::klend(),
-            vec![AccountMeta::new(obligation, false)],
+            obl_metas,
             encode_refresh_obligation(),
         ),
     });
@@ -87,9 +153,7 @@ pub fn build_inventory_tx(params: &KaminoTxBuildParams, swaps: &[LabeledIx]) -> 
             ix: compute_unit_price(params.cu_price),
         },
     ];
-    let mut reserves = params.deposit_reserves.clone();
-    reserves.extend(params.borrow_reserves.iter().copied());
-    ixs.extend(refresh_ixs(params.obligation, &reserves));
+    ixs.extend(refresh_ixs(params));
     ixs.push(liquidate_ix(params));
     ixs.extend(swaps.iter().cloned());
     ixs
@@ -108,9 +172,7 @@ pub fn build_flash_tx(params: &KaminoTxBuildParams, swaps: &[LabeledIx]) -> Opti
             ix: compute_unit_price(params.cu_price),
         },
     ];
-    let mut reserves = params.deposit_reserves.clone();
-    reserves.extend(params.borrow_reserves.iter().copied());
-    ixs.extend(refresh_ixs(params.obligation, &reserves));
+    ixs.extend(refresh_ixs(params));
     let borrow_idx = ixs.len() as u8;
     ixs.push(LabeledIx {
         label: "flash_borrow_reserve_liquidity".into(),
@@ -175,6 +237,7 @@ mod tests {
             cu_limit: 400_000,
             cu_price: 1000,
             flash: None,
+            refresh_reserves: vec![],
         };
         let ixs = build_inventory_tx(&params, &[]);
         assert!(ixs.len() >= 5);
@@ -267,6 +330,7 @@ mod flash_builder_tests {
             cu_limit: 400_000,
             cu_price: 1000,
             flash: Some((b, r)),
+            refresh_reserves: vec![],
         };
         let ixs = build_flash_tx(&params, &[]).expect("flash");
         let labels: Vec<_> = ixs.iter().map(|l| l.label.as_str()).collect();

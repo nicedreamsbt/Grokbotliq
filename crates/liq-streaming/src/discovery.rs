@@ -24,6 +24,13 @@ pub mod known {
         // Well-known high-lamport system account (Binance 2 cold — public address only)
         "5tzFkiKscXHK5ZXCGbXZxdw7gTjjD1mBwuoFbhUvuAi9",
     ];
+    /// Klend main market authority PDA (seeds b"lma"+market, bump 255).
+    pub const KLEND_MAIN_MARKET_AUTHORITY: &str =
+        "BWk2q2cei3KnkE51qmo51BZrcvxL9GnvTc7EYfhRmSn8";
+    /// Save / Solend classic Obligation account sizes observed / documented.
+    pub const SAVE_OBLIGATION_DATASIZES: &[u64] = &[1300, 916, 1192];
+    /// Save lending market pubkey offset inside Obligation (classic layout).
+    pub const SAVE_OBLIGATION_MARKET_OFFSET: u64 = 10;
 
     /// Klend Obligation account size (8-byte disc + layout) — from klend IDL / docs.
     pub const KLEND_OBLIGATION_DATASIZE: u64 = 3344;
@@ -39,6 +46,9 @@ pub mod known {
 pub struct DiscoveredAccount {
     pub protocol: String,
     pub kind: String,
+    /// Full base58 (public on-chain address) for follow-up getMultipleAccounts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pubkey: Option<String>,
     /// Short base58 for reports.
     pub pubkey_short: String,
     pub data_len: usize,
@@ -79,12 +89,18 @@ pub fn classify_klend_obligation(addr: &Pubkey, data: &[u8]) -> DiscoveredAccoun
         notes.push("too_short_for_value_fields".into());
         "incomplete".into()
     } else {
-        match liq_kamino::decode_obligation_live_header(*addr, data) {
-            Ok(h) => {
+        match liq_kamino::decode_obligation_live_positions(*addr, data) {
+            Ok(pos) => {
+                let h = &pos.header;
                 notes.push(format!("market={}", short_b58(&h.lending_market.to_base58())));
                 notes.push(format!("has_debt={}", h.has_debt));
+                notes.push(format!("n_deposits={}", pos.deposits.len()));
+                notes.push(format!("n_borrows={}", pos.borrows.len()));
+                if let Some((repay, withdraw)) = liq_kamino::pick_liquidate_reserves(&pos) {
+                    notes.push(format!("repay_res={}", short_b58(&repay.to_base58())));
+                    notes.push(format!("withdraw_res={}", short_b58(&withdraw.to_base58())));
+                }
                 if h.has_debt && h.borrowed_assets_market_value_sf > 0 {
-                    // Approximate HF = unhealthy / borrowed (SF units cancel).
                     let hf = if h.borrowed_assets_market_value_sf == 0 {
                         1000.0
                     } else {
@@ -105,17 +121,40 @@ pub fn classify_klend_obligation(addr: &Pubkey, data: &[u8]) -> DiscoveredAccoun
                 } else {
                     notes.push("no_debt_or_zero_borrow_sf".into());
                 }
-                "live_header".into()
+                "live_positions".into()
             }
-            Err(e) => {
-                notes.push(format!("decode_err={e}"));
-                "unknown".into()
-            }
+            Err(_) => match liq_kamino::decode_obligation_live_header(*addr, data) {
+                Ok(h) => {
+                    notes.push(format!("market={}", short_b58(&h.lending_market.to_base58())));
+                    notes.push(format!("has_debt={}", h.has_debt));
+                    if h.has_debt && h.borrowed_assets_market_value_sf > 0 {
+                        let hf = (h.unhealthy_borrow_value_sf as f64)
+                            / (h.borrowed_assets_market_value_sf as f64);
+                        health = Some(hf);
+                        let band_e = if hf < 1.0 {
+                            CandidateBand::Critical
+                        } else if hf < 1.05 {
+                            CandidateBand::Hot
+                        } else if hf < 1.2 {
+                            CandidateBand::Warm
+                        } else {
+                            CandidateBand::Cold
+                        };
+                        band = Some(band_e.as_str().into());
+                    }
+                    "live_header".into()
+                }
+                Err(e) => {
+                    notes.push(format!("decode_err={e}"));
+                    "unknown".into()
+                }
+            },
         }
     };
     DiscoveredAccount {
         protocol: format!("{:?}", Protocol::Kamino),
         kind: "obligation".into(),
+        pubkey: Some(addr.to_base58()),
         pubkey_short: short_pk(addr),
         data_len: data.len(),
         decode,
@@ -139,6 +178,7 @@ fn classify_raw(protocol: Protocol, kind: &str, a: &RawAccount) -> DiscoveredAcc
     DiscoveredAccount {
         protocol: format!("{protocol:?}"),
         kind: kind.into(),
+        pubkey: Some(a.pubkey.to_base58()),
         pubkey_short: short_pk(&a.pubkey),
         data_len: a.data.len(),
         decode,
@@ -337,40 +377,52 @@ pub async fn discover_mainnet(pool: &RotatingRpcPool) -> Result<DiscoveryReport,
     }
     // Save obligation layout/size varies by market version; unscoped GPA is RPS-hostile.
     // Prefer market getAccountInfo proof + optional tiny memcmp sample (owner byte shard).
-    gaps.push(
-        "Save: skipped full GPA — obligation dataSize/market offset not yet pinned; market account fetched via getMultipleAccounts"
-            .into(),
-    );
-    let save_sample_filters = vec![
-        json!({
-            "memcmp": {
-                "offset": 10,
-                "bytes": known::SAVE_MAIN_MARKET
+    // Pin Save obligation: try documented classic sizes @ market offset 10.
+    let mut save_found = false;
+    for &ds in known::SAVE_OBLIGATION_DATASIZES {
+        let save_sample_filters = vec![
+            json!({
+                "memcmp": {
+                    "offset": known::SAVE_OBLIGATION_MARKET_OFFSET,
+                    "bytes": known::SAVE_MAIN_MARKET
+                }
+            }),
+            json!({ "dataSize": ds }),
+        ];
+        match boot
+            .get_program_accounts_filtered(&liq_core::programs::save(), &save_sample_filters)
+            .await
+        {
+            Ok(accts) if !accts.is_empty() => {
+                counts["save_accounts"] = json!(accts.len());
+                info!(n = accts.len(), data_size = ds, "save obligations sample");
+                gaps.push(format!(
+                    "Save: pinned obligation dataSize={ds}, market offset={}",
+                    known::SAVE_OBLIGATION_MARKET_OFFSET
+                ));
+                for a in accts.iter().take(16) {
+                    let mut d = classify_raw(Protocol::Save, "obligation", a);
+                    d.notes.push(format!("save_datasize={ds}"));
+                    scanned.push(d);
+                }
+                save_found = true;
+                break;
             }
-        }),
-        // shard: first byte of pubkey path not available in filters; use dataSize common classic size 916
-        json!({ "dataSize": 916 }),
-    ];
-    match boot
-        .get_program_accounts_filtered(&liq_core::programs::save(), &save_sample_filters)
-        .await
-    {
-        Ok(accts) => {
-            counts["save_accounts"] = json!(accts.len());
-            info!(n = accts.len(), "save accounts sample (dataSize=916 + market@10)");
-            for a in accts.iter().take(16) {
-                let mut d = classify_raw(Protocol::Save, "obligation?", a);
-                d.notes.push("save_partial_sample".into());
-                scanned.push(d);
+            Ok(_) => continue,
+            Err(e) => {
+                gaps.push(format!("save GPA dataSize={ds}: {e}"));
             }
         }
-        Err(e) => {
-            gaps.push(format!("save sample GPA failed (market still fetched): {e}"));
-        }
+    }
+    if !save_found {
+        gaps.push(
+            "Save: no obligation GPA hit for dataSizes 1300/916/1192 @ market offset 10; market account still fetched"
+                .into(),
+        );
     }
 
     gaps.push(
-        "Full Anchor zero-copy (Kamino deposits/borrows arrays, marginfi balances, Save reserves) still incomplete — live_header SF health used where available"
+        "Marginfi balances / Save reserve vault zero-copy still incomplete; Kamino live_positions decode used for deposits/borrows when GPA data present"
             .into(),
     );
 

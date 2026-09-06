@@ -7,7 +7,8 @@ use liq_core::{
     ProfitDecision, ProfitInput, ProfitabilityCalculator, Protocol, TriggerHit, UpdateSource,
 };
 use liq_execution::{
-    build_strategy_ixs, BidProfile, ExecConfig, ExecutionEngine, PlanAccountSet, PreparedTx,
+    build_strategy_ixs, encode_versioned_tx_base64, BidProfile, ExecConfig, ExecutionEngine,
+    PlanAccountSet, PreparedTx,
 };
 use liq_risk::{CircuitBreaker, RiskLimits};
 use liq_routing::JupiterQuoteBlob;
@@ -15,9 +16,8 @@ use liq_streaming::{
     borrower_to_meta, borrower_triggers, discover_mainnet, drain_all, load_borrowers,
     load_local_env_files, load_oracle_ticks, pool_from_env, resolve_fixtures_dir,
     rpc_url_configured, rpc_urls_from_env, shadow_tx_base64, ticks_to_events, BorrowerFixture,
-    FixtureBootstrap, HttpJsonRpcTransport, JsonRpcBootstrap, MockGeyser,
-    known, minimal_cu_limit_tx_base64_with_payer, RpcBootstrap, StreamEvent,
-    YellowstoneConfig,
+    FixtureBootstrap, HttpJsonRpcTransport, JsonRpcBootstrap, MockGeyser, known, RpcBootstrap,
+    StreamEvent, YellowstoneConfig,
 };
 use liq_telemetry::Metrics;
 use serde::Serialize;
@@ -127,25 +127,24 @@ async fn run_mainnet_shadow() -> anyhow::Result<()> {
     let boot = JsonRpcBootstrap::new(pool.clone());
     let mut simulate_results = Vec::new();
 
-    // Pick a real mainnet account as simulate fee-payer (sigVerify=false — never signed).
-    let mut sim_payer = [1u8; 32];
-    let mut sim_payer_short = "synthetic".to_string();
-    for cand in known::SIM_FEE_PAYER_CANDIDATES {
-        if let Some(pk) = liq_core::Pubkey::from_base58(cand) {
-            match boot.get_account_info(&pk).await {
-                Ok(Some(a)) if a.lamports > 0 => {
-                    sim_payer = a.pubkey.0;
-                    sim_payer_short = liq_streaming::short_b58(cand);
-                    info!(payer = %sim_payer_short, lamports = a.lamports, "simulate fee-payer selected");
-                    break;
-                }
-                _ => continue,
-            }
+    // Fee payer for unsigned sim: SHADOW_FEE_PAYER pubkey (no private key) or known default.
+    let (sim_payer, sim_payer_short, fee_payer_source) = resolve_shadow_fee_payer(&boot).await?;
+    info!(
+        payer = %sim_payer_short,
+        source = %fee_payer_source,
+        "simulate fee-payer selected"
+    );
+
+    let (blockhash, bh_slot) = match boot.get_latest_blockhash().await {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(error = %e, "getLatestBlockhash failed — using zero hash + replaceRecentBlockhash");
+            ([0u8; 32], discovery.slot)
         }
-    }
+    };
+    info!(bh_slot, "latest blockhash fetched for strategy vtx");
 
-
-    // Prefer CRITICAL/HOT candidates from discovery; else simulate a synthetic plan proving RPC path.
+    // Prefer CRITICAL/HOT candidates from discovery; limit sims (RPS-friendly).
     let hot: Vec<_> = discovery
         .candidates
         .iter()
@@ -157,6 +156,7 @@ async fn run_mainnet_shadow() -> anyhow::Result<()> {
         .collect();
 
     let mut planned = 0usize;
+    let mut extra_gaps: Vec<String> = Vec::new();
     for cand in hot.iter().take(3) {
         let protocol = match cand.protocol.as_str() {
             "Kamino" => Protocol::Kamino,
@@ -169,9 +169,9 @@ async fn run_mainnet_shadow() -> anyhow::Result<()> {
             Protocol::Save => FundingStrategy::SaveFlashLoan,
             Protocol::Project0 => FundingStrategy::Project0Receivership,
         };
-        // Seed accounts from candidate short key bytes are unavailable — use deterministic seed.
-        let seed = liq_core::Pubkey::test(0xA5, planned as u64);
-        let accounts = PlanAccountSet::from_seed(seed);
+
+        let (accounts, account_notes) =
+            build_plan_accounts_for_candidate(&boot, &cand, protocol, &sim_payer).await;
         let built = build_strategy_ixs(
             protocol,
             strategy,
@@ -189,7 +189,7 @@ async fn run_mainnet_shadow() -> anyhow::Result<()> {
             notional_usd_micro: 1_000_000,
             expected_profit_usd_micro: 0,
             wire: envelope.clone().into_bytes(),
-            instructions: wire_ixs,
+            instructions: wire_ixs.clone(),
             funding_strategy: Some(strategy.as_str().to_string()),
             ixs: built.labeled.iter().map(|l| l.label.clone()).collect(),
         };
@@ -197,18 +197,49 @@ async fn run_mainnet_shadow() -> anyhow::Result<()> {
         ensure!(res.dry_run && res.signature.is_none());
         planned += 1;
 
-        // Plan builders emit Instruction lists; live RPC needs VersionedTransaction wire.
-        // Simulate a minimal valid CU-limit vtx (sigVerify=false) as proof-of-RPC until signing is wired.
-        let wire = minimal_cu_limit_tx_base64_with_payer(200_000, &sim_payer);
-        let _ = envelope; // strategy envelope retained in PreparedTx path above (dry-run only)
+        let vtx_note;
+        let wire = match encode_versioned_tx_base64(&wire_ixs, &sim_payer, &blockhash) {
+            Ok(b64) => {
+                vtx_note = "strategy VersionedTransaction-encoded (v0, unsigned dummy sigs)";
+                b64
+            }
+            Err(e) => {
+                warn!(error = %e, "vtx encode failed");
+                simulate_results.push(json!({
+                    "account": cand.pubkey_short,
+                    "protocol": cand.protocol,
+                    "rpc_ok": false,
+                    "ok": false,
+                    "error": format!("vtx encode: {e}"),
+                    "plan_ix_count": planned_ixs_count,
+                    "strategy_vtx": false,
+                    "account_notes": account_notes,
+                }));
+                continue;
+            }
+        };
+
         match boot.simulate_transaction(&wire, false).await {
             Ok(sim) => {
+                let logs_trimmed: Vec<String> = sim
+                    .logs
+                    .iter()
+                    .take(24)
+                    .map(|l| {
+                        if l.len() > 240 {
+                            format!("{}…", &l[..240])
+                        } else {
+                            l.clone()
+                        }
+                    })
+                    .collect();
                 info!(
                     account = %cand.pubkey_short,
                     err = ?sim.err,
                     units = ?sim.units_consumed,
                     plan_ixs = planned_ixs_count,
-                    "simulateTransaction minimal vtx (sigVerify=false)"
+                    live = accounts.from_live_decode,
+                    "simulateTransaction strategy vtx (sigVerify=false)"
                 );
                 simulate_results.push(json!({
                     "account": cand.pubkey_short,
@@ -218,9 +249,16 @@ async fn run_mainnet_shadow() -> anyhow::Result<()> {
                     "err": sim.err,
                     "units_consumed": sim.units_consumed,
                     "log_count": sim.logs.len(),
+                    "logs_trimmed": logs_trimmed,
                     "plan_ix_count": planned_ixs_count,
                     "fee_payer": sim_payer_short,
-                    "note": "simulated minimal CU vtx; strategy plan not yet VersionedTransaction-encoded",
+                    "fee_payer_source": fee_payer_source,
+                    "funding_strategy": strategy.as_str(),
+                    "used_flash_builder": built.used_flash_builder,
+                    "from_live_decode": accounts.from_live_decode,
+                    "strategy_vtx": true,
+                    "note": vtx_note,
+                    "account_notes": account_notes,
                 }));
             }
             Err(e) => {
@@ -232,44 +270,63 @@ async fn run_mainnet_shadow() -> anyhow::Result<()> {
                     "ok": false,
                     "error": e.to_string(),
                     "plan_ix_count": planned_ixs_count,
+                    "strategy_vtx": true,
+                    "note": vtx_note,
+                    "account_notes": account_notes,
                 }));
             }
         }
     }
 
     if planned == 0 {
-        let wire = minimal_cu_limit_tx_base64_with_payer(200_000, &sim_payer);
-        match boot.simulate_transaction(&wire, false).await {
-            Ok(sim) => {
-                info!(
-                    err = ?sim.err,
-                    units = ?sim.units_consumed,
-                    "zero-candidate prove simulate (sigVerify=false)"
-                );
-                simulate_results.push(json!({
-                    "account": null,
-                    "protocol": "prove",
-                    "rpc_ok": true,
-                    "ok": sim.err.is_none(),
-                    "err": sim.err,
-                    "units_consumed": sim.units_consumed,
-                    "fee_payer": sim_payer_short,
-                    "note": "no HOT/CRITICAL candidates; simulated minimal CU vtx",
-                }));
-            }
-            Err(e) => {
-                simulate_results.push(json!({
-                    "account": null,
-                    "protocol": "prove",
-                    "rpc_ok": false,
-                    "ok": false,
-                    "error": e.to_string(),
-                }));
-            }
+        extra_gaps.push("no HOT/CRITICAL candidates to strategy-simulate".into());
+        // Still prove vtx path with CU+price ixs (not "minimal CU stub" alone — labeled strategy_vtx prove).
+        let prove_ixs = vec![
+            liq_core::compute_unit_limit(200_000),
+            liq_core::compute_unit_price(1_000),
+        ];
+        match encode_versioned_tx_base64(&prove_ixs, &sim_payer, &blockhash) {
+            Ok(wire) => match boot.simulate_transaction(&wire, false).await {
+                Ok(sim) => {
+                    simulate_results.push(json!({
+                        "account": null,
+                        "protocol": "prove",
+                        "rpc_ok": true,
+                        "ok": sim.err.is_none(),
+                        "err": sim.err,
+                        "units_consumed": sim.units_consumed,
+                        "fee_payer": sim_payer_short,
+                        "fee_payer_source": fee_payer_source,
+                        "strategy_vtx": true,
+                        "note": "no HOT/CRITICAL candidates; simulated VersionedTransaction CU ixs (not strategy plan)",
+                    }));
+                }
+                Err(e) => {
+                    simulate_results.push(json!({
+                        "account": null,
+                        "protocol": "prove",
+                        "rpc_ok": false,
+                        "ok": false,
+                        "error": e.to_string(),
+                        "strategy_vtx": true,
+                    }));
+                }
+            },
+            Err(e) => extra_gaps.push(format!("prove vtx encode failed: {e}")),
         }
     }
 
-    let report = json!({
+    let mut gaps = discovery.gaps.clone();
+    gaps.extend(extra_gaps);
+    gaps.push(format!(
+        "shadow fee payer source={fee_payer_source}; SHADOW_FEE_PAYER is pubkey-only (never a private key)"
+    ));
+    gaps.push(
+        "Kamino strategy vtx reaches live RefreshReserve (oracle prices in logs); later ixs still fail (InvalidAccountInput / missing liquidator ATAs, farms placeholders) — expected until full ATA+farm wiring"
+            .into(),
+    );
+
+        let report = json!({
         "mode": "mainnet_shadow",
         "dry_run": true,
         "broadcast": false,
@@ -285,7 +342,9 @@ async fn run_mainnet_shadow() -> anyhow::Result<()> {
         "candidates_hot_critical": hot.len(),
         "plans_built": planned,
         "simulate_results": simulate_results,
-        "gaps": discovery.gaps,
+        "strategy_vtx_encoding": true,
+        "fee_payer_source": fee_payer_source,
+        "gaps": gaps,
     });
 
     let out = PathBuf::from("artifacts/shadow-report.json");
@@ -513,6 +572,201 @@ async fn run_fixture_shadow(fixtures_arg: Option<String>) -> anyhow::Result<()> 
         "shadow complete (no broadcast)"
     );
     Ok(())
+}
+
+
+async fn resolve_shadow_fee_payer<T: liq_streaming::JsonRpcTransport>(
+    boot: &JsonRpcBootstrap<T>,
+) -> anyhow::Result<(liq_core::Pubkey, String, &'static str)> {
+    if let Ok(s) = std::env::var("SHADOW_FEE_PAYER") {
+        let t = s.trim();
+        if !t.is_empty() {
+            if let Some(pk) = liq_core::Pubkey::from_base58(t) {
+                return Ok((
+                    pk,
+                    liq_streaming::short_b58(t),
+                    "SHADOW_FEE_PAYER env",
+                ));
+            }
+            warn!(value_len = t.len(), "SHADOW_FEE_PAYER not valid base58 — falling back");
+        }
+    }
+    for cand in known::SIM_FEE_PAYER_CANDIDATES {
+        if let Some(pk) = liq_core::Pubkey::from_base58(cand) {
+            match boot.get_account_info(&pk).await {
+                Ok(Some(a)) if a.lamports > 0 => {
+                    return Ok((
+                        a.pubkey,
+                        liq_streaming::short_b58(cand),
+                        "known SIM_FEE_PAYER_CANDIDATES",
+                    ));
+                }
+                _ => continue,
+            }
+        }
+    }
+    // Documented default (Save market owner) — may AccountNotFound; still labeled.
+    let default = known::SIM_FEE_PAYER_CANDIDATES[0];
+    let pk = liq_core::Pubkey::from_base58(default)
+        .context("default fee payer decode")?;
+    Ok((
+        pk,
+        liq_streaming::short_b58(default),
+        "default documented placeholder (Save market owner)",
+    ))
+}
+
+async fn build_plan_accounts_for_candidate<T: liq_streaming::JsonRpcTransport>(
+    boot: &JsonRpcBootstrap<T>,
+    cand: &liq_streaming::DiscoveredAccount,
+    protocol: Protocol,
+    fee_payer: &liq_core::Pubkey,
+) -> (PlanAccountSet, Vec<String>) {
+    let mut notes = Vec::new();
+    if protocol != Protocol::Kamino {
+        notes.push("non-Kamino: PlanAccountSet::from_seed (live metas TBD)".into());
+        let seed = cand
+            .pubkey
+            .as_deref()
+            .and_then(liq_core::Pubkey::from_base58)
+            .unwrap_or_else(|| liq_core::Pubkey::test(0xA5, 1));
+        let mut a = PlanAccountSet::from_seed(seed);
+        a.liquidator = *fee_payer;
+        return (a, notes);
+    }
+    let Some(pk_s) = cand.pubkey.as_deref() else {
+        notes.push("missing full pubkey on candidate — seed fallback".into());
+        let mut a = PlanAccountSet::from_seed(liq_core::Pubkey::test(0xA5, 2));
+        a.liquidator = *fee_payer;
+        return (a, notes);
+    };
+    let Some(obl_pk) = liq_core::Pubkey::from_base58(pk_s) else {
+        notes.push("bad obligation pubkey".into());
+        let mut a = PlanAccountSet::from_seed(liq_core::Pubkey::test(0xA5, 3));
+        a.liquidator = *fee_payer;
+        return (a, notes);
+    };
+    let obl_acct = match boot.get_account_info(&obl_pk).await {
+        Ok(Some(a)) => a,
+        Ok(None) => {
+            notes.push("obligation account missing".into());
+            let mut a = PlanAccountSet::from_seed(obl_pk);
+            a.liquidator = *fee_payer;
+            return (a, notes);
+        }
+        Err(e) => {
+            notes.push(format!("get_account_info obl: {e}"));
+            let mut a = PlanAccountSet::from_seed(obl_pk);
+            a.liquidator = *fee_payer;
+            return (a, notes);
+        }
+    };
+    let positions = match liq_kamino::decode_obligation_live_positions(obl_pk, &obl_acct.data) {
+        Ok(p) => p,
+        Err(e) => {
+            notes.push(format!("live_positions decode failed: {e}"));
+            let mut a = PlanAccountSet::from_seed(obl_pk);
+            a.liquidator = *fee_payer;
+            a.lending_market = liq_core::Pubkey::from_base58(known::KLEND_MAIN_MARKET)
+                .unwrap_or(a.lending_market);
+            return (a, notes);
+        }
+    };
+    notes.push(format!(
+        "live_positions deposits={} borrows={}",
+        positions.deposits.len(),
+        positions.borrows.len()
+    ));
+    let Some((repay_pk, withdraw_pk)) = liq_kamino::pick_liquidate_reserves(&positions) else {
+        notes.push("no repay/withdraw reserves in positions".into());
+        let mut a = PlanAccountSet::from_seed(obl_pk);
+        a.liquidator = *fee_payer;
+        a.lending_market = positions.header.lending_market;
+        a.obligation = obl_pk;
+        return (a, notes);
+    };
+    // Fetch all unique reserves for refresh metas + repay/withdraw vaults.
+    let mut reserve_keys = Vec::new();
+    for d in &positions.deposits {
+        if !reserve_keys.contains(&d.reserve) {
+            reserve_keys.push(d.reserve);
+        }
+    }
+    for b in &positions.borrows {
+        if !reserve_keys.contains(&b.reserve) {
+            reserve_keys.push(b.reserve);
+        }
+    }
+    for extra in [repay_pk, withdraw_pk] {
+        if !reserve_keys.contains(&extra) {
+            reserve_keys.push(extra);
+        }
+    }
+    let fetched = match boot.get_multiple_accounts(&reserve_keys).await {
+        Ok(v) => v,
+        Err(e) => {
+            notes.push(format!("getMultipleAccounts reserves: {e}"));
+            let mut a = PlanAccountSet::from_seed(obl_pk);
+            a.liquidator = *fee_payer;
+            a.obligation = obl_pk;
+            a.lending_market = positions.header.lending_market;
+            a.repay_reserve = repay_pk;
+            a.withdraw_reserve = withdraw_pk;
+            return (a, notes);
+        }
+    };
+    let mut vaults = std::collections::HashMap::new();
+    for (i, key) in reserve_keys.iter().enumerate() {
+        if let Some(Some(raw)) = fetched.get(i) {
+            match liq_kamino::decode_reserve_live_vaults(*key, &raw.data) {
+                Ok(v) => {
+                    vaults.insert(*key, v);
+                }
+                Err(e) => notes.push(format!("reserve decode {}: {e}", liq_streaming::short_b58(&key.to_base58()))),
+            }
+        } else {
+            notes.push(format!("reserve missing {}", liq_streaming::short_b58(&key.to_base58())));
+        }
+    }
+    let (Some(repay_v), Some(withdraw_v)) = (vaults.get(&repay_pk), vaults.get(&withdraw_pk)) else {
+        notes.push("repay/withdraw vault decode incomplete".into());
+        let mut a = PlanAccountSet::from_seed(obl_pk);
+        a.liquidator = *fee_payer;
+        a.obligation = obl_pk;
+        a.repay_reserve = repay_pk;
+        a.withdraw_reserve = withdraw_pk;
+        return (a, notes);
+    };
+    notes.push(format!(
+        "live_vaults repay_mint={} withdraw_coll={} n_reserves={}",
+        liq_streaming::short_b58(&repay_v.liquidity_mint.to_base58()),
+        liq_streaming::short_b58(&withdraw_v.collateral_mint.to_base58()),
+        vaults.len()
+    ));
+    let market_auth = liq_core::Pubkey::from_base58(known::KLEND_MAIN_MARKET_AUTHORITY)
+        .unwrap_or_else(|| liq_core::Pubkey::test(0xBB, 1));
+    let mut accounts = PlanAccountSet::from_kamino_live(
+        obl_pk,
+        *fee_payer,
+        &positions,
+        repay_v,
+        withdraw_v,
+        market_auth,
+    );
+    // Overlay full refresh metas for every fetched reserve.
+    accounts.refresh_reserve_metas = vaults
+        .values()
+        .map(|r| liq_kamino::RefreshReserveAccounts {
+            reserve: r.address,
+            lending_market: r.lending_market,
+            pyth_oracle: r.pyth_oracle,
+            switchboard_price: r.switchboard_price,
+            switchboard_twap: r.switchboard_twap,
+            scope_prices: r.scope_prices,
+        })
+        .collect();
+    notes.push("PlanAccountSet from live Klend positions+reserves".into());
+    (accounts, notes)
 }
 
 #[tokio::main]

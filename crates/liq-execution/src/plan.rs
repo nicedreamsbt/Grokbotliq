@@ -6,7 +6,7 @@ use liq_core::{
 };
 use liq_kamino::{
     build_flash_tx, build_inventory_tx, FlashBorrowAccounts, FlashRepayAccounts,
-    KaminoTxBuildParams, LiquidateV2Accounts,
+    KaminoTxBuildParams, LiquidateV2Accounts, RefreshReserveAccounts,
 };
 use liq_routing::JupiterQuoteBlob;
 use liq_save::{
@@ -27,6 +27,24 @@ pub struct PlanAccountSet {
     pub withdraw_reserve: Pubkey,
     pub user_liquidity: Pubkey,
     pub user_collateral: Pubkey,
+    /// When set (live decode), used instead of synthetic mint/supply placeholders.
+    pub repay_liquidity_mint: Option<Pubkey>,
+    pub repay_liquidity_supply: Option<Pubkey>,
+    pub repay_fee_receiver: Option<Pubkey>,
+    pub withdraw_liquidity_mint: Option<Pubkey>,
+    pub withdraw_collateral_mint: Option<Pubkey>,
+    pub withdraw_collateral_supply: Option<Pubkey>,
+    pub withdraw_liquidity_supply: Option<Pubkey>,
+    pub withdraw_fee_receiver: Option<Pubkey>,
+    pub repay_token_program: Option<Pubkey>,
+    pub withdraw_token_program: Option<Pubkey>,
+    /// Extra deposit reserves to refresh (from live obligation deposits).
+    pub deposit_reserves_extra: Vec<Pubkey>,
+    pub borrow_reserves_extra: Vec<Pubkey>,
+    /// True when core keys came from live Klend decode.
+    pub from_live_decode: bool,
+    /// Live refresh_reserve metas (market + oracles) when decoded.
+    pub refresh_reserve_metas: Vec<RefreshReserveAccounts>,
 }
 
 impl PlanAccountSet {
@@ -44,51 +62,138 @@ impl PlanAccountSet {
             withdraw_reserve: pk(6),
             user_liquidity: pk(7),
             user_collateral: pk(8),
+            repay_liquidity_mint: None,
+            repay_liquidity_supply: None,
+            repay_fee_receiver: None,
+            withdraw_liquidity_mint: None,
+            withdraw_collateral_mint: None,
+            withdraw_collateral_supply: None,
+            withdraw_liquidity_supply: None,
+            withdraw_fee_receiver: None,
+            repay_token_program: None,
+            withdraw_token_program: None,
+            deposit_reserves_extra: vec![],
+            borrow_reserves_extra: vec![],
+            from_live_decode: false,
+            refresh_reserve_metas: vec![],
+        }
+    }
+
+    /// Build from live Klend obligation positions + reserve vault metas.
+    pub fn from_kamino_live(
+        obligation: Pubkey,
+        liquidator: Pubkey,
+        positions: &liq_kamino::LiveObligationPositions,
+        repay: &liq_kamino::LiveReserveVaults,
+        withdraw: &liq_kamino::LiveReserveVaults,
+        market_authority: Pubkey,
+    ) -> Self {
+        let deposit_reserves_extra: Vec<_> = positions.deposits.iter().map(|d| d.reserve).collect();
+        let borrow_reserves_extra: Vec<_> = positions.borrows.iter().map(|b| b.reserve).collect();
+        Self {
+            liquidator,
+            obligation,
+            lending_market: positions.header.lending_market,
+            lending_market_authority: market_authority,
+            repay_reserve: repay.address,
+            withdraw_reserve: withdraw.address,
+            // User ATAs unknown in unsigned shadow — placeholders (sim will fail on token accounts).
+            user_liquidity: Pubkey::test(0xFE, 1),
+            user_collateral: Pubkey::test(0xFE, 2),
+            repay_liquidity_mint: Some(repay.liquidity_mint),
+            repay_liquidity_supply: Some(repay.liquidity_supply),
+            repay_fee_receiver: Some(repay.fee_vault),
+            withdraw_liquidity_mint: Some(withdraw.liquidity_mint),
+            withdraw_collateral_mint: Some(withdraw.collateral_mint),
+            withdraw_collateral_supply: Some(withdraw.collateral_supply),
+            withdraw_liquidity_supply: Some(withdraw.liquidity_supply),
+            withdraw_fee_receiver: Some(withdraw.fee_vault),
+            repay_token_program: Some(repay.token_program),
+            withdraw_token_program: Some(withdraw.token_program),
+            deposit_reserves_extra,
+            borrow_reserves_extra,
+            from_live_decode: true,
+            refresh_reserve_metas: {
+                let mut v = Vec::new();
+                for r in [repay, withdraw] {
+                    v.push(RefreshReserveAccounts {
+                        reserve: r.address,
+                        lending_market: r.lending_market,
+                        pyth_oracle: r.pyth_oracle,
+                        switchboard_price: r.switchboard_price,
+                        switchboard_twap: r.switchboard_twap,
+                        scope_prices: r.scope_prices,
+                    });
+                }
+                v
+            },
         }
     }
 }
 
 fn kamino_liquidate_accounts(a: &PlanAccountSet) -> LiquidateV2Accounts {
+    let synth = |tag: u64| Pubkey::test(a.repay_reserve.0[0], tag);
     LiquidateV2Accounts {
         liquidator: a.liquidator,
         obligation: a.obligation,
         lending_market: a.lending_market,
         lending_market_authority: a.lending_market_authority,
         repay_reserve: a.repay_reserve,
-        repay_reserve_liquidity_mint: Pubkey::test(a.repay_reserve.0[0], 100),
-        repay_reserve_liquidity_supply: Pubkey::test(a.repay_reserve.0[0], 101),
+        repay_reserve_liquidity_mint: a.repay_liquidity_mint.unwrap_or_else(|| synth(100)),
+        repay_reserve_liquidity_supply: a.repay_liquidity_supply.unwrap_or_else(|| synth(101)),
         withdraw_reserve: a.withdraw_reserve,
-        withdraw_reserve_liquidity_mint: Pubkey::test(a.withdraw_reserve.0[0], 102),
-        withdraw_reserve_collateral_mint: Pubkey::test(a.withdraw_reserve.0[0], 103),
-        withdraw_reserve_collateral_supply: Pubkey::test(a.withdraw_reserve.0[0], 104),
-        withdraw_reserve_liquidity_supply: Pubkey::test(a.withdraw_reserve.0[0], 105),
-        withdraw_reserve_liquidity_fee_receiver: Pubkey::test(a.withdraw_reserve.0[0], 106),
+        withdraw_reserve_liquidity_mint: a
+            .withdraw_liquidity_mint
+            .unwrap_or_else(|| Pubkey::test(a.withdraw_reserve.0[0], 102)),
+        withdraw_reserve_collateral_mint: a
+            .withdraw_collateral_mint
+            .unwrap_or_else(|| Pubkey::test(a.withdraw_reserve.0[0], 103)),
+        withdraw_reserve_collateral_supply: a
+            .withdraw_collateral_supply
+            .unwrap_or_else(|| Pubkey::test(a.withdraw_reserve.0[0], 104)),
+        withdraw_reserve_liquidity_supply: a
+            .withdraw_liquidity_supply
+            .unwrap_or_else(|| Pubkey::test(a.withdraw_reserve.0[0], 105)),
+        withdraw_reserve_liquidity_fee_receiver: a
+            .withdraw_fee_receiver
+            .unwrap_or_else(|| Pubkey::test(a.withdraw_reserve.0[0], 106)),
         user_source_liquidity: a.user_liquidity,
         user_destination_collateral: a.user_collateral,
         user_destination_liquidity: a.user_liquidity,
-        collateral_token_program: programs::token(),
-        repay_liquidity_token_program: programs::token(),
-        withdraw_liquidity_token_program: programs::token(),
+        collateral_token_program: a.withdraw_token_program.unwrap_or_else(programs::token),
+        repay_liquidity_token_program: a.repay_token_program.unwrap_or_else(programs::token),
+        withdraw_liquidity_token_program: a.withdraw_token_program.unwrap_or_else(programs::token),
         instruction_sysvar_account: programs::sysvar_instructions(),
         collateral_obligation_farm_user_state: None,
         collateral_reserve_farm_state: None,
         debt_obligation_farm_user_state: None,
         debt_reserve_farm_state: None,
-        farms_program: Pubkey::test(90, 1),
-        deposit_reserves: vec![],
+        farms_program: Pubkey::from_base58("FarmsPZpWu9i7Kky8tPN37rs2TpmMrAZrC7S7vJa91Hr")
+            .unwrap_or_else(|| Pubkey::test(90, 1)),
+        deposit_reserves: a.deposit_reserves_extra.clone(),
     }
 }
 
 fn kamino_flash_pair(a: &PlanAccountSet) -> (FlashBorrowAccounts, FlashRepayAccounts) {
+    let mint = a
+        .repay_liquidity_mint
+        .unwrap_or_else(|| Pubkey::test(a.repay_reserve.0[0], 100));
+    let supply = a
+        .repay_liquidity_supply
+        .unwrap_or_else(|| Pubkey::test(a.repay_reserve.0[0], 101));
+    let fee = a
+        .repay_fee_receiver
+        .or(a.withdraw_fee_receiver)
+        .unwrap_or_else(|| Pubkey::test(a.withdraw_reserve.0[0], 106));
     let borrow = FlashBorrowAccounts {
         user_transfer_authority: a.liquidator,
         lending_market_authority: a.lending_market_authority,
         lending_market: a.lending_market,
         reserve: a.repay_reserve,
-        reserve_liquidity_mint: Pubkey::test(a.repay_reserve.0[0], 100),
-        reserve_source_liquidity: Pubkey::test(a.repay_reserve.0[0], 101),
+        reserve_liquidity_mint: mint,
+        reserve_source_liquidity: supply,
         user_destination_liquidity: a.user_liquidity,
-        reserve_liquidity_fee_receiver: Pubkey::test(a.withdraw_reserve.0[0], 106),
+        reserve_liquidity_fee_receiver: fee,
         referrer_token_state: None, // → KLend program id readonly
         referrer_account: None,
     };
@@ -97,10 +202,10 @@ fn kamino_flash_pair(a: &PlanAccountSet) -> (FlashBorrowAccounts, FlashRepayAcco
         lending_market_authority: a.lending_market_authority,
         lending_market: a.lending_market,
         reserve: a.repay_reserve,
-        reserve_liquidity_mint: Pubkey::test(a.repay_reserve.0[0], 100),
-        reserve_destination_liquidity: Pubkey::test(a.repay_reserve.0[0], 101),
+        reserve_liquidity_mint: mint,
+        reserve_destination_liquidity: supply,
         user_source_liquidity: a.user_liquidity,
-        reserve_liquidity_fee_receiver: Pubkey::test(a.withdraw_reserve.0[0], 106),
+        reserve_liquidity_fee_receiver: fee,
         referrer_token_state: None,
         referrer_account: None,
     };
@@ -166,10 +271,26 @@ pub fn build_strategy_ixs(
     match (protocol, strategy) {
         (Protocol::Kamino, FundingStrategy::KaminoFlashBorrow) => {
             let (borrow, repay) = kamino_flash_pair(accounts);
+            let mut deposit_reserves = if accounts.deposit_reserves_extra.is_empty() {
+                vec![accounts.withdraw_reserve]
+            } else {
+                accounts.deposit_reserves_extra.clone()
+            };
+            let mut borrow_reserves = if accounts.borrow_reserves_extra.is_empty() {
+                vec![accounts.repay_reserve]
+            } else {
+                accounts.borrow_reserves_extra.clone()
+            };
+            if !deposit_reserves.contains(&accounts.withdraw_reserve) {
+                deposit_reserves.push(accounts.withdraw_reserve);
+            }
+            if !borrow_reserves.contains(&accounts.repay_reserve) {
+                borrow_reserves.push(accounts.repay_reserve);
+            }
             let params = KaminoTxBuildParams {
                 obligation: accounts.obligation,
-                deposit_reserves: vec![accounts.withdraw_reserve],
-                borrow_reserves: vec![accounts.repay_reserve],
+                deposit_reserves,
+                borrow_reserves,
                 liquidate: kamino_liquidate_accounts(accounts),
                 liquidity_amount,
                 min_acceptable_received: 0,
@@ -177,6 +298,7 @@ pub fn build_strategy_ixs(
                 cu_limit: 400_000,
                 cu_price: 1_000,
                 flash: Some((borrow, repay)),
+                refresh_reserves: accounts.refresh_reserve_metas.clone(),
             };
             let labeled = build_flash_tx(&params, &swaps).unwrap_or_default();
             PlannedIxs {
@@ -186,10 +308,20 @@ pub fn build_strategy_ixs(
             }
         }
         (Protocol::Kamino, FundingStrategy::Inventory) => {
+            let deposit_reserves = if accounts.deposit_reserves_extra.is_empty() {
+                vec![accounts.withdraw_reserve]
+            } else {
+                accounts.deposit_reserves_extra.clone()
+            };
+            let borrow_reserves = if accounts.borrow_reserves_extra.is_empty() {
+                vec![accounts.repay_reserve]
+            } else {
+                accounts.borrow_reserves_extra.clone()
+            };
             let params = KaminoTxBuildParams {
                 obligation: accounts.obligation,
-                deposit_reserves: vec![accounts.withdraw_reserve],
-                borrow_reserves: vec![accounts.repay_reserve],
+                deposit_reserves,
+                borrow_reserves,
                 liquidate: kamino_liquidate_accounts(accounts),
                 liquidity_amount,
                 min_acceptable_received: 0,
@@ -197,6 +329,7 @@ pub fn build_strategy_ixs(
                 cu_limit: 400_000,
                 cu_price: 1_000,
                 flash: None,
+                refresh_reserves: accounts.refresh_reserve_metas.clone(),
             };
             PlannedIxs {
                 labeled: build_inventory_tx(&params, &swaps),

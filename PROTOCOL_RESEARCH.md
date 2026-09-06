@@ -139,7 +139,9 @@ Wire builders in `liq-project0::tx_builder` emit real `Instruction` lists (progr
 - Trait + mock + **multi-provider freshness failover** in `liq-streaming`
 - **HTTP JSON-RPC (reqwest)** `HttpJsonRpcTransport` + `JsonRpcBootstrap`: `getSlot`, `getHealth`, `getAccountInfo`, `getMultipleAccounts`, filtered `getProgramAccounts`, `simulateTransaction`
 - **`RotatingRpcPool`**: `RPC_URLS` / `RPC_URL` from gitignored `config/local.env`; rotate on 429/5xx/timeout; host-only telemetry
-- **Mainnet discovery**: known Klend market / marginfi group / Save market + filtered GPA; Klend live SF header decode
+- **Mainnet discovery**: known Klend market / marginfi group / Save market + filtered GPA; Klend `live_positions` (deposits/borrows) + reserve vault/oracle decode
+- **Shadow strategy vtx**: `liq-execution::encode_versioned_tx_base64` (v0, unsigned dummy sigs) simulates real plan ixs (`simulateTransaction`, sigVerify=false) — not a CU-only stub
+- **Save obligation pin**: dataSize **1300**, market memcmp offset **10** (classic main pool GPA sample)
 - Yellowstone: stub retained; **prefer working RPC bootstrap** over half-broken gRPC until yellowstone-grpc is linked
 - Env: `GEYSER_ENDPOINT`, `GEYSER_X_TOKEN`, optional `GEYSER_COMMITMENT`, `GEYSER_PING_MS`; `LIQ_FIXTURES` for offline CI; `LIQ_MAINNET_SHADOW=1`
 

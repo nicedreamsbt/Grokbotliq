@@ -9,6 +9,7 @@ mod jito;
 mod rpc;
 mod plan;
 mod template;
+mod vtx;
 
 pub use alt::*;
 pub use bid::*;
@@ -18,6 +19,7 @@ pub use jito::*;
 pub use rpc::*;
 pub use plan::*;
 pub use template::*;
+pub use vtx::*;
 
 use async_trait::async_trait;
 use liq_risk::{CircuitBreaker, RiskReject};

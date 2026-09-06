@@ -530,6 +530,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "base64",
+ "bs58",
  "liq-core",
  "liq-kamino",
  "liq-project0",

@@ -210,6 +210,15 @@ pub fn jsonrpc_get_health() -> Value {
     })
 }
 
+pub fn jsonrpc_get_latest_blockhash(commitment: &str) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getLatestBlockhash",
+        "params": [{ "commitment": commitment }]
+    })
+}
+
 pub fn jsonrpc_simulate_transaction(tx_base64: &str, sig_verify: bool) -> Value {
     json!({
         "jsonrpc": "2.0",
@@ -435,6 +444,29 @@ impl<T: JsonRpcTransport> JsonRpcBootstrap<T> {
             Some(v) => Ok(v.to_string()),
             None => Err(BootstrapError::Decode("getHealth result".into())),
         }
+    }
+
+    /// Fetch latest blockhash bytes (32) via getLatestBlockhash.
+    pub async fn get_latest_blockhash(&self) -> Result<([u8; 32], u64), BootstrapError> {
+        let body = jsonrpc_get_latest_blockhash(&self.commitment);
+        let resp = self.transport.post_json(&body).await?;
+        let hash_s = resp
+            .pointer("/result/value/blockhash")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| BootstrapError::Decode("getLatestBlockhash blockhash".into()))?;
+        let bytes = bs58::decode(hash_s)
+            .into_vec()
+            .map_err(|e| BootstrapError::Decode(format!("blockhash b58: {e}")))?;
+        if bytes.len() != 32 {
+            return Err(BootstrapError::Decode(format!(
+                "blockhash len {}",
+                bytes.len()
+            )));
+        }
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&bytes);
+        let slot = result_slot(&resp);
+        Ok((out, slot))
     }
 
     pub async fn get_program_accounts_filtered(

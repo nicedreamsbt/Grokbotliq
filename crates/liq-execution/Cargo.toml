@@ -21,3 +21,4 @@ async-trait = { workspace = true }
 tokio = { workspace = true }
 parking_lot = { workspace = true }
 base64 = { workspace = true }
+bs58 = { workspace = true }
