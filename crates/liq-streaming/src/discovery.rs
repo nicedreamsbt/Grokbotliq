@@ -4,9 +4,10 @@
 use crate::bootstrap::{BootstrapError, JsonRpcBootstrap, RawAccount, RpcBootstrap};
 use crate::redact::short_b58;
 use crate::rpc_pool::{EndpointStats, RotatingRpcPool};
-use liq_core::{CandidateBand, Protocol, Pubkey};
+use liq_core::{Protocol, Pubkey};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use tracing::{info, warn};
 
 /// Documented mainnet pubkeys (PROTOCOL_RESEARCH + public docs).
@@ -59,6 +60,20 @@ pub struct DiscoveredAccount {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KlendHealthStats {
+    pub obligations_decoded: usize,
+    pub with_debt: usize,
+    pub liquidatable: usize,
+    pub below_maintenance: usize,
+    pub missing_reserve_price: usize,
+    pub sample_healthy: Vec<DiscoveredAccount>,
+    pub min_health: Option<f64>,
+    pub max_health: Option<f64>,
+    pub median_health: Option<f64>,
+    pub p10_health: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiscoveryReport {
     pub slot: u64,
     pub health: String,
@@ -69,6 +84,9 @@ pub struct DiscoveryReport {
     pub accounts_scanned: usize,
     pub by_protocol: Value,
     pub candidates: Vec<DiscoveredAccount>,
+    /// Liquidatable / below-maintenance only (honest; never SF-header CRITICAL).
+    pub liquidatable_candidates: Vec<DiscoveredAccount>,
+    pub klend_health_stats: Option<KlendHealthStats>,
     pub gaps: Vec<String>,
 }
 
@@ -80,8 +98,28 @@ fn short_pk(p: &Pubkey) -> String {
     short_b58(&p.to_base58())
 }
 
-/// Partial live Klend Obligation decode using IDL offsets (see decode module in liq-kamino).
+/// Classify a Klend obligation using **live** deposits/borrows + reserve risk/prices.
+///
+/// Does **not** mark CRITICAL from stale obligation SF headers. Without a reserve
+/// map, returns decode notes only (no liquidatable claim).
 pub fn classify_klend_obligation(addr: &Pubkey, data: &[u8]) -> DiscoveredAccount {
+    classify_klend_obligation_with_reserves(addr, data, None)
+}
+
+pub fn classify_klend_obligation_with_reserves(
+    addr: &Pubkey,
+    data: &[u8],
+    reserves: Option<&HashMap<Pubkey, liq_kamino::LiveReserveRisk>>,
+) -> DiscoveredAccount {
+    classify_klend_obligation_full(addr, data, reserves, None)
+}
+
+pub fn classify_klend_obligation_full(
+    addr: &Pubkey,
+    data: &[u8],
+    reserves: Option<&HashMap<Pubkey, liq_kamino::LiveReserveRisk>>,
+    elevation_groups: Option<&HashMap<u8, liq_kamino::ElevationGroupParams>>,
+) -> DiscoveredAccount {
     let mut notes = Vec::new();
     let mut health = None;
     let mut band = None;
@@ -100,48 +138,78 @@ pub fn classify_klend_obligation(addr: &Pubkey, data: &[u8]) -> DiscoveredAccoun
                     notes.push(format!("repay_res={}", short_b58(&repay.to_base58())));
                     notes.push(format!("withdraw_res={}", short_b58(&withdraw.to_base58())));
                 }
-                if h.has_debt && h.borrowed_assets_market_value_sf > 0 {
-                    let hf = if h.borrowed_assets_market_value_sf == 0 {
-                        1000.0
-                    } else {
-                        (h.unhealthy_borrow_value_sf as f64)
-                            / (h.borrowed_assets_market_value_sf as f64)
-                    };
-                    health = Some(hf);
-                    let band_e = if hf < 1.0 {
-                        CandidateBand::Critical
-                    } else if hf < 1.05 {
-                        CandidateBand::Hot
-                    } else if hf < 1.2 {
-                        CandidateBand::Warm
-                    } else {
-                        CandidateBand::Cold
-                    };
-                    band = Some(band_e.as_str().into());
+                // Diagnostic only: stale SF-header ratio (never drives CRITICAL).
+                if h.has_debt {
+                    if let Some(stale) = liq_kamino::stale_sf_header_health_ratio(
+                        if h.borrow_factor_adjusted_debt_value_sf > 0 {
+                            h.borrow_factor_adjusted_debt_value_sf
+                        } else {
+                            h.borrowed_assets_market_value_sf
+                        },
+                        h.unhealthy_borrow_value_sf,
+                    ) {
+                        notes.push(format!("stale_sf_hf={stale:.6}"));
+                    }
+                }
+                if let Some(map) = reserves {
+                    notes.push(format!("elevation_group={}", pos.header.elevation_group));
+                    match liq_kamino::compute_obligation_health_live_with_elevation(
+                        &pos,
+                        map,
+                        elevation_groups,
+                    ) {
+                        Ok(ch) => {
+                            notes.push(format!("ltv={:.6}", ch.ltv));
+                            notes.push(format!(
+                                "unhealthy_usd_micro={}",
+                                ch.unhealthy_borrow_value_usd_micro
+                            ));
+                            notes.push(format!(
+                                "bf_debt_usd_micro={}",
+                                ch.borrow_factor_adjusted_debt_usd_micro
+                            ));
+                            if !ch.missing_reserves.is_empty() {
+                                notes.push(format!(
+                                    "missing_reserves={}",
+                                    ch.missing_reserves.len()
+                                ));
+                            }
+                            if ch.borrow_factor_adjusted_debt_usd_micro > 0
+                                || ch.deposited_value_usd_micro > 0
+                            {
+                                health = Some(ch.health_factor);
+                                let band_e = liq_kamino::band_from_klend_health(&ch);
+                                // Only CRITICAL when truly liquidatable.
+                                band = Some(band_e.as_str().into());
+                                if ch.is_liquidatable {
+                                    notes.push("liquidatable=true".into());
+                                } else if ch.below_maintenance {
+                                    notes.push("below_maintenance=true".into());
+                                } else {
+                                    notes.push("healthy=true".into());
+                                }
+                            } else if h.has_debt {
+                                notes.push("health_incomplete_no_prices".into());
+                            } else {
+                                notes.push("no_debt_or_zero_borrow_sf".into());
+                            }
+                        }
+                        Err(e) => notes.push(format!("health_err={e}")),
+                    }
+                    "live_health".into()
+                } else if h.has_debt {
+                    notes.push("no_reserve_map_skip_critical".into());
+                    "live_positions".into()
                 } else {
                     notes.push("no_debt_or_zero_borrow_sf".into());
+                    "live_positions".into()
                 }
-                "live_positions".into()
             }
             Err(_) => match liq_kamino::decode_obligation_live_header(*addr, data) {
                 Ok(h) => {
                     notes.push(format!("market={}", short_b58(&h.lending_market.to_base58())));
                     notes.push(format!("has_debt={}", h.has_debt));
-                    if h.has_debt && h.borrowed_assets_market_value_sf > 0 {
-                        let hf = (h.unhealthy_borrow_value_sf as f64)
-                            / (h.borrowed_assets_market_value_sf as f64);
-                        health = Some(hf);
-                        let band_e = if hf < 1.0 {
-                            CandidateBand::Critical
-                        } else if hf < 1.05 {
-                            CandidateBand::Hot
-                        } else if hf < 1.2 {
-                            CandidateBand::Warm
-                        } else {
-                            CandidateBand::Cold
-                        };
-                        band = Some(band_e.as_str().into());
-                    }
+                    notes.push("positions_decode_failed_header_only".into());
                     "live_header".into()
                 }
                 Err(e) => {
@@ -162,6 +230,14 @@ pub fn classify_klend_obligation(addr: &Pubkey, data: &[u8]) -> DiscoveredAccoun
         band,
         notes,
     }
+}
+
+fn percentile(sorted: &[f64], p: f64) -> Option<f64> {
+    if sorted.is_empty() {
+        return None;
+    }
+    let idx = ((p * (sorted.len() as f64 - 1.0)).round() as usize).min(sorted.len() - 1);
+    Some(sorted[idx])
 }
 
 fn classify_raw(protocol: Protocol, kind: &str, a: &RawAccount) -> DiscoveredAccount {
@@ -228,6 +304,8 @@ pub async fn discover_mainnet(pool: &RotatingRpcPool) -> Result<DiscoveryReport,
     }
 
     let mut scanned: Vec<DiscoveredAccount> = Vec::new();
+    let mut liquidatable_candidates: Vec<DiscoveredAccount> = Vec::new();
+    let mut klend_health_stats: Option<KlendHealthStats> = None;
     let mut counts = json!({
         "kamino_obligations": 0,
         "kamino_reserves": 0,
@@ -236,7 +314,58 @@ pub async fn discover_mainnet(pool: &RotatingRpcPool) -> Result<DiscoveryReport,
         "save_accounts": 0,
     });
 
-    // --- Klend obligations: dataSize + memcmp lending_market @ 32 ---
+    // Elevation groups from main lending market (overrides reserve LTV/thr when elev≠0).
+    let mut elevation_map: HashMap<u8, liq_kamino::ElevationGroupParams> = HashMap::new();
+    if let Some(Some(mkt)) = known_accts.first() {
+        match liq_kamino::decode_lending_market_elevation_groups(&mkt.data) {
+            Ok(m) => {
+                info!(n = m.len(), "klend elevation groups decoded");
+                elevation_map = m;
+            }
+            Err(e) => gaps.push(format!("klend elevation groups: {e}")),
+        }
+    }
+
+    // --- Klend reserves first (prices + liq thresholds for live health) ---
+    let mut reserve_map: HashMap<Pubkey, liq_kamino::LiveReserveRisk> = HashMap::new();
+    let res_filters = vec![
+        json!({ "dataSize": known::KLEND_RESERVE_DATASIZE }),
+        json!({
+            "memcmp": {
+                "offset": 32,
+                "bytes": known::KLEND_MAIN_MARKET
+            }
+        }),
+    ];
+    match boot
+        .get_program_accounts_filtered(&liq_core::programs::klend(), &res_filters)
+        .await
+    {
+        Ok(accts) => {
+            counts["kamino_reserves"] = json!(accts.len());
+            info!(n = accts.len(), "klend reserves (filtered GPA)");
+            for a in &accts {
+                if let Ok(r) = liq_kamino::decode_reserve_live_risk(a.pubkey, &a.data) {
+                    reserve_map.insert(a.pubkey, r);
+                }
+            }
+            let priced = reserve_map.values().filter(|r| r.market_price_sf > 0).count();
+            info!(
+                decoded = reserve_map.len(),
+                priced,
+                "klend reserve risk map ready"
+            );
+            if priced == 0 {
+                gaps.push("klend reserves decoded but all market_price_sf=0".into());
+            }
+        }
+        Err(e) => {
+            warn!(error = %e, "klend reserve GPA failed");
+            gaps.push(format!("klend reserve GPA: {e}"));
+        }
+    }
+
+    // --- Klend obligations: live health over full GPA window (in-memory) ---
     let obl_filters = vec![
         json!({ "dataSize": known::KLEND_OBLIGATION_DATASIZE }),
         json!({
@@ -253,65 +382,99 @@ pub async fn discover_mainnet(pool: &RotatingRpcPool) -> Result<DiscoveryReport,
         Ok(accts) => {
             counts["kamino_obligations"] = json!(accts.len());
             info!(n = accts.len(), "klend obligations (filtered GPA)");
-            // Cap detailed decode for report / candidate scan
-            for a in accts.iter().take(64) {
-                scanned.push(classify_klend_obligation(&a.pubkey, &a.data));
+            let reserves_ref = if reserve_map.is_empty() {
+                None
+            } else {
+                Some(&reserve_map)
+            };
+            let elev_ref = if elevation_map.is_empty() {
+                None
+            } else {
+                Some(&elevation_map)
+            };
+            let mut healths: Vec<f64> = Vec::new();
+            let mut with_debt = 0usize;
+            let mut liquidatable = 0usize;
+            let mut below_maint = 0usize;
+            let mut missing_px = 0usize;
+            let mut sample_healthy: Vec<DiscoveredAccount> = Vec::new();
+            let mut decoded = 0usize;
+            // Scan all accounts already downloaded — no extra RPC.
+            for a in &accts {
+                let d = classify_klend_obligation_full(
+                    &a.pubkey,
+                    &a.data,
+                    reserves_ref,
+                    elev_ref,
+                );
+                decoded += 1;
+                let is_debt = d.notes.iter().any(|n| n == "has_debt=true");
+                if is_debt {
+                    with_debt += 1;
+                }
+                if d.notes.iter().any(|n| n.starts_with("missing_reserves=")) {
+                    missing_px += 1;
+                }
+                if let Some(hf) = d.health {
+                    healths.push(hf);
+                }
+                let is_liq = d.band.as_deref() == Some("CRITICAL")
+                    || d.notes.iter().any(|n| n == "liquidatable=true");
+                let is_bm = d.notes.iter().any(|n| n == "below_maintenance=true");
+                if is_liq {
+                    liquidatable += 1;
+                    liquidatable_candidates.push(d.clone());
+                } else if is_bm {
+                    below_maint += 1;
+                    // Above max LTV but not liquidatable — do not simulate liquidate.
+                } else if sample_healthy.len() < 8 {
+                    if d.health.is_some() && is_debt {
+                        sample_healthy.push(d.clone());
+                    }
+                }
+                // Keep a compact scanned sample for the report (not all 100k).
+                if scanned.len() < 48 {
+                    if is_liq || is_bm || scanned.len() < 16 {
+                        scanned.push(d);
+                    }
+                }
             }
-            if accts.len() > 64 {
+            healths.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            // Rank liquidatable by health ascending (most unhealthy first).
+            liquidatable_candidates.sort_by(|a, b| {
+                let ha = a.health.unwrap_or(f64::MAX);
+                let hb = b.health.unwrap_or(f64::MAX);
+                ha.partial_cmp(&hb).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            info!(
+                decoded,
+                with_debt,
+                liquidatable,
+                below_maint,
+                "klend live health scan complete"
+            );
+            if liquidatable == 0 {
                 gaps.push(format!(
-                    "klend obligations truncated in report: {} total, decoded first 64",
-                    accts.len()
+                    "klend: zero liquidatable in scan window ({decoded} obligations, {with_debt} with debt); sample healthy stats attached — not pretending CRITICAL"
                 ));
             }
+            klend_health_stats = Some(KlendHealthStats {
+                obligations_decoded: decoded,
+                with_debt,
+                liquidatable,
+                below_maintenance: below_maint,
+                missing_reserve_price: missing_px,
+                sample_healthy,
+                min_health: healths.first().copied(),
+                max_health: healths.last().copied(),
+                median_health: percentile(&healths, 0.5),
+                p10_health: percentile(&healths, 0.1),
+            });
         }
         Err(e) => {
-            warn!(error = %e, "klend obligation GPA failed — falling back to reserves-only");
+            warn!(error = %e, "klend obligation GPA failed");
             gaps.push(format!("klend obligation GPA: {e}"));
-            // Fallback: smaller scoped reserves fetch
-            let res_filters = vec![
-                json!({ "dataSize": known::KLEND_RESERVE_DATASIZE }),
-                json!({
-                    "memcmp": {
-                        "offset": 32,
-                        "bytes": known::KLEND_MAIN_MARKET
-                    }
-                }),
-            ];
-            match boot
-                .get_program_accounts_filtered(&liq_core::programs::klend(), &res_filters)
-                .await
-            {
-                Ok(accts) => {
-                    counts["kamino_reserves"] = json!(accts.len());
-                    for a in accts.iter().take(32) {
-                        scanned.push(classify_raw(Protocol::Kamino, "reserve", a));
-                    }
-                }
-                Err(e2) => gaps.push(format!("klend reserve GPA: {e2}")),
-            }
-        }
-    }
-
-    // If obligations GPA succeeded but we want reserve count too (cheap-ish).
-    if counts["kamino_reserves"] == 0 {
-        let res_filters = vec![
-            json!({ "dataSize": known::KLEND_RESERVE_DATASIZE }),
-            json!({
-                "memcmp": {
-                    "offset": 32,
-                    "bytes": known::KLEND_MAIN_MARKET
-                }
-            }),
-        ];
-        match boot
-            .get_program_accounts_filtered(&liq_core::programs::klend(), &res_filters)
-            .await
-        {
-            Ok(accts) => {
-                counts["kamino_reserves"] = json!(accts.len());
-                info!(n = accts.len(), "klend reserves (filtered GPA)");
-            }
-            Err(e) => gaps.push(format!("klend reserve GPA: {e}")),
+            // reserves already fetched; obligation GPA failed
         }
     }
 
@@ -422,20 +585,21 @@ pub async fn discover_mainnet(pool: &RotatingRpcPool) -> Result<DiscoveryReport,
     }
 
     gaps.push(
-        "Marginfi balances / Save reserve vault zero-copy still incomplete; Kamino live_positions decode used for deposits/borrows when GPA data present"
+        "Marginfi balances / Save reserve vault zero-copy still incomplete; Kamino live health uses deposits/borrows + reserve marketPriceSf + liqThreshold"
             .into(),
     );
 
-    let candidates: Vec<_> = scanned
-        .iter()
-        .filter(|c| {
-            matches!(
-                c.band.as_deref(),
-                Some("CRITICAL") | Some("HOT") | Some("WARM")
-            ) || c.health.map(|h| h < 1.05).unwrap_or(false)
-        })
-        .cloned()
-        .collect();
+    // Report candidates: liquidatable / below-maintenance first, else sample near-threshold HOT only.
+    let mut candidates: Vec<DiscoveredAccount> = liquidatable_candidates.clone();
+    if candidates.is_empty() {
+        // Do not promote healthy SF-header rows to CRITICAL/HOT.
+        gaps.push(
+            "no liquidatable/below-maintenance Kamino obligations — candidates list is empty (see klend_health_stats.sample_healthy)"
+                .into(),
+        );
+    }
+    // Cap report size
+    candidates.truncate(32);
 
     let accounts_scanned = {
         let mut n = 0usize;
@@ -466,6 +630,8 @@ pub async fn discover_mainnet(pool: &RotatingRpcPool) -> Result<DiscoveryReport,
         accounts_scanned,
         by_protocol: counts,
         candidates,
+        liquidatable_candidates,
+        klend_health_stats,
         gaps,
     })
 }

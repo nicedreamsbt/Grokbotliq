@@ -144,19 +144,38 @@ async fn run_mainnet_shadow() -> anyhow::Result<()> {
     };
     info!(bh_slot, "latest blockhash fetched for strategy vtx");
 
-    // Prefer CRITICAL/HOT candidates from discovery; limit sims (RPS-friendly).
-    let hot: Vec<_> = discovery
-        .candidates
-        .iter()
-        .filter(|c| {
-            matches!(c.band.as_deref(), Some("CRITICAL") | Some("HOT"))
-                || c.health.map(|h| h < 1.0).unwrap_or(false)
-        })
-        .cloned()
-        .collect();
+    // Only simulate truly liquidatable (or below-maintenance if discovery flagged CRITICAL).
+    // Never promote stale-SF healthy obligations.
+    let hot: Vec<_> = if !discovery.liquidatable_candidates.is_empty() {
+        discovery.liquidatable_candidates.clone()
+    } else {
+        discovery
+            .candidates
+            .iter()
+            .filter(|c| {
+                c.notes.iter().any(|n| n == "liquidatable=true")
+                    || (c.band.as_deref() == Some("CRITICAL")
+                        && c.decode == "live_health"
+                        && c.health.map(|h| h < 1.0).unwrap_or(false))
+            })
+            .cloned()
+            .collect()
+    };
 
     let mut planned = 0usize;
     let mut extra_gaps: Vec<String> = Vec::new();
+    if hot.is_empty() {
+        if let Some(stats) = &discovery.klend_health_stats {
+            extra_gaps.push(format!(
+                "no liquidatable found (decoded={}, with_debt={}, liquidatable=0, below_maint={}, median_hf={:?}, p10_hf={:?})",
+                stats.obligations_decoded,
+                stats.with_debt,
+                stats.below_maintenance,
+                stats.median_health,
+                stats.p10_health
+            ));
+        }
+    }
     for cand in hot.iter().take(3) {
         let protocol = match cand.protocol.as_str() {
             "Kamino" => Protocol::Kamino,
@@ -284,7 +303,10 @@ async fn run_mainnet_shadow() -> anyhow::Result<()> {
     }
 
     if planned == 0 {
-        extra_gaps.push("no HOT/CRITICAL candidates to strategy-simulate".into());
+        extra_gaps.push(
+            "no liquidatable candidates to strategy-simulate (honest zero — not pretending CRITICAL)"
+                .into(),
+        );
         // Still prove vtx path with CU+price ixs (not "minimal CU stub" alone — labeled strategy_vtx prove).
         let prove_ixs = vec![
             liq_core::compute_unit_limit(200_000),
@@ -303,7 +325,7 @@ async fn run_mainnet_shadow() -> anyhow::Result<()> {
                         "fee_payer": sim_payer_short,
                         "fee_payer_source": fee_payer_source,
                         "strategy_vtx": true,
-                        "note": "no HOT/CRITICAL candidates; simulated VersionedTransaction CU ixs (not strategy plan)",
+                        "note": "no liquidatable candidates; simulated VersionedTransaction CU ixs (not strategy plan)",
                     }));
                 }
                 Err(e) => {
@@ -343,6 +365,8 @@ async fn run_mainnet_shadow() -> anyhow::Result<()> {
         "known_markets": discovery.known_markets,
         "program_ids": discovery.program_ids,
         "candidates": discovery.candidates,
+        "liquidatable_candidates": discovery.liquidatable_candidates,
+        "klend_health_stats": discovery.klend_health_stats,
         "candidates_hot_critical": hot.len(),
         "plans_built": planned,
         "simulate_results": simulate_results,

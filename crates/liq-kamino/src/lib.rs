@@ -6,6 +6,7 @@
 mod accounts;
 mod decode;
 mod flash;
+mod live_health;
 mod refresh;
 mod scope;
 mod tx_builder;
@@ -13,6 +14,7 @@ mod tx_builder;
 pub use accounts::*;
 pub use decode::*;
 pub use flash::*;
+pub use live_health::*;
 pub use refresh::*;
 pub use scope::*;
 pub use tx_builder::*;

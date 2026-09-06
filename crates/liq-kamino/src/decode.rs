@@ -131,19 +131,27 @@ pub fn encode_obligation_planning(obl: &KaminoObligation) -> Vec<u8> {
 /// Offsets from klend IDL account layout (+8 disc):
 /// - lending_market @ 32
 /// - deposited_value_sf @ 1192
+/// - borrow_factor_adjusted_debt_value_sf @ 2208
 /// - borrowed_assets_market_value_sf @ 2224
+/// - allowed_borrow_value_sf @ 2240
 /// - unhealthy_borrow_value_sf @ 2256
 /// - has_debt @ 2287
+///
+/// **Stale warning:** SF value fields are only correct after `refresh_obligation`.
+/// Prefer `compute_obligation_health_live` with reserve prices for candidate selection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiveObligationHeader {
     pub address: Pubkey,
     pub lending_market: Pubkey,
     pub owner: Pubkey,
     pub deposited_value_sf: u128,
+    pub borrow_factor_adjusted_debt_value_sf: u128,
     pub borrowed_assets_market_value_sf: u128,
     pub allowed_borrow_value_sf: u128,
     pub unhealthy_borrow_value_sf: u128,
     pub has_debt: bool,
+    /// Elevation group id (0 = none). When non-zero, market elevation LTV/threshold apply.
+    pub elevation_group: u8,
     /// Referrer wallet; default pubkey means no referrer.
     pub referrer: Pubkey,
 }
@@ -163,10 +171,13 @@ pub fn decode_obligation_live_header(
     let lending_market = Pubkey::from_bytes(&data[32..64]).ok_or(DecodeError::TooShort)?;
     let owner = Pubkey::from_bytes(&data[64..96]).ok_or(DecodeError::TooShort)?;
     let deposited_value_sf = u128::from_le_bytes(data[1192..1208].try_into().unwrap());
+    let borrow_factor_adjusted_debt_value_sf =
+        u128::from_le_bytes(data[2208..2224].try_into().unwrap());
     let borrowed_assets_market_value_sf =
         u128::from_le_bytes(data[2224..2240].try_into().unwrap());
     let allowed_borrow_value_sf = u128::from_le_bytes(data[2240..2256].try_into().unwrap());
     let unhealthy_borrow_value_sf = u128::from_le_bytes(data[2256..2272].try_into().unwrap());
+    let elevation_group = data[2285];
     let has_debt = data[2287] != 0;
     let referrer = if data.len() >= LIVE_REFERRER_OFFSET + 32 {
         Pubkey::from_bytes(&data[LIVE_REFERRER_OFFSET..LIVE_REFERRER_OFFSET + 32])
@@ -179,19 +190,25 @@ pub fn decode_obligation_live_header(
         lending_market,
         owner,
         deposited_value_sf,
+        borrow_factor_adjusted_debt_value_sf,
         borrowed_assets_market_value_sf,
         allowed_borrow_value_sf,
         unhealthy_borrow_value_sf,
         has_debt,
+        elevation_group,
         referrer,
     })
 }
 
-/// True when on-chain SF values indicate liquidatable (borrowed > unhealthy threshold).
+/// True when **stale** on-chain SF values indicate liquidatable
+/// (`borrow_factor_adjusted_debt > unhealthy`). Prefer live recompute for selection.
 pub fn live_obligation_is_liquidatable(h: &LiveObligationHeader) -> bool {
-    h.has_debt
-        && h.borrowed_assets_market_value_sf > 0
-        && h.borrowed_assets_market_value_sf > h.unhealthy_borrow_value_sf
+    let debt = if h.borrow_factor_adjusted_debt_value_sf > 0 {
+        h.borrow_factor_adjusted_debt_value_sf
+    } else {
+        h.borrowed_assets_market_value_sf
+    };
+    h.has_debt && debt > 0 && debt > h.unhealthy_borrow_value_sf
 }
 
 /// True when obligation.referrer is a non-default pubkey (klend has_referrer).
@@ -247,14 +264,17 @@ mod tests {
         let owner = Pubkey::test(11, 2);
         data[32..64].copy_from_slice(&market.0);
         data[64..96].copy_from_slice(&owner.0);
-        let borrowed: u128 = 200;
+        let bf_debt: u128 = 200;
+        let borrowed: u128 = 180;
         let unhealthy: u128 = 100;
+        data[2208..2224].copy_from_slice(&bf_debt.to_le_bytes());
         data[2224..2240].copy_from_slice(&borrowed.to_le_bytes());
         data[2256..2272].copy_from_slice(&unhealthy.to_le_bytes());
         data[2287] = 1;
         let h = decode_obligation_live_header(Pubkey::test(11, 3), &data).unwrap();
         assert_eq!(h.lending_market, market);
         assert_eq!(h.owner, owner);
+        assert_eq!(h.borrow_factor_adjusted_debt_value_sf, bf_debt);
         assert!(live_obligation_is_liquidatable(&h));
     }
 }
