@@ -131,7 +131,7 @@ Args: borrow `{ liquidityAmount: u64 }`; repay `{ liquidityAmount: u64, borrowIn
 
 **liquidate_v2 farm placeholders:** official klend-sdk codegen uses **KLend program ID readonly** when optional farm accounts are absent (not the Farms program id). `farmsProgram` meta remains `FarmsPZp…`.
 
-**Shadow liquidator ATAs:** derived via Associated Token Program (`[owner, token_program, mint]`) for `SHADOW_FEE_PAYER` / sim fee payer — no private key.
+**Shadow liquidator ATAs:** derived via Associated Token Program (`[owner, token_program, mint]`) for `SHADOW_FEE_PAYER` / sim fee payer — no private key. Token program is Tokenkeg or Token-2022 from reserve decode (`token_program_from_mint_owner` helper available). Shadow/planner insert Associated Token Program **CreateIdempotent** (data byte `1`) for missing liquidator ATAs (repay liquidity, withdraw collateral, withdraw liquidity) **after refresh / before flash_borrow & liquidate_v2** so flash `borrowInstructionIndex` stays correct. After CreateIdempotent clears `AccountNotInitialized` (3012), liquidate_v2 may next hit **Custom 6009 `ReserveStale`** (reserve needs refresh — often because flash_borrow mutates the repay reserve before liquidate).
 
 ### Project 0 receivership (flash alternative)
 

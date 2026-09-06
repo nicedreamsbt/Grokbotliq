@@ -5,7 +5,7 @@ use liq_core::{
     programs, FundingStrategy, LabeledIx, Protocol, Pubkey,
 };
 use liq_kamino::{
-    build_flash_tx, build_inventory_tx, FlashBorrowAccounts, FlashRepayAccounts,
+    build_flash_tx, build_inventory_tx, EnsureAta, FlashBorrowAccounts, FlashRepayAccounts,
     KaminoTxBuildParams, LiquidateV2Accounts, RefreshReserveAccounts,
 };
 use liq_routing::JupiterQuoteBlob;
@@ -56,6 +56,9 @@ pub struct PlanAccountSet {
     pub referrer: Option<Pubkey>,
     /// ReferrerTokenState PDAs aligned with borrow_reserves_extra (when referrer set).
     pub referrer_token_states: Vec<Pubkey>,
+    /// When `Some`, only emit CreateIdempotent for these ATA addresses (missing on-chain).
+    /// When `None`, emit CreateIdempotent for all liquidator ATAs (idempotent).
+    pub missing_ata_filter: Option<Vec<Pubkey>>,
 }
 
 impl PlanAccountSet {
@@ -94,6 +97,7 @@ impl PlanAccountSet {
             debt_reserve_farm_state: None,
             referrer: None,
             referrer_token_states: vec![],
+            missing_ata_filter: None,
         }
     }
 
@@ -197,7 +201,61 @@ impl PlanAccountSet {
             debt_reserve_farm_state: None,
             referrer,
             referrer_token_states,
+            missing_ata_filter: None,
         }
+    }
+
+    /// Build CreateIdempotent specs for liquidator repay/collateral/dest ATAs.
+    /// Uses mint + token_program from live decode when present; Tokenkeg otherwise.
+    /// Honors `missing_ata_filter` when set (shadow prefetch of absent accounts).
+    pub fn liquidator_ensure_atas(&self) -> Vec<EnsureAta> {
+        let repay_tp = self.repay_token_program.unwrap_or_else(programs::token);
+        let withdraw_tp = self.withdraw_token_program.unwrap_or_else(programs::token);
+        let repay_mint = self
+            .repay_liquidity_mint
+            .unwrap_or_else(|| Pubkey::test(self.repay_reserve.0[0], 100));
+        let coll_mint = self.withdraw_collateral_mint.unwrap_or_else(|| {
+            Pubkey::test(self.withdraw_reserve.0[0], 103)
+        });
+        let withdraw_liq_mint = self.withdraw_liquidity_mint.unwrap_or_else(|| {
+            Pubkey::test(self.withdraw_reserve.0[0], 102)
+        });
+        let specs = [
+            EnsureAta {
+                payer: self.liquidator,
+                owner: self.liquidator,
+                mint: repay_mint,
+                token_program: repay_tp,
+            },
+            EnsureAta {
+                payer: self.liquidator,
+                owner: self.liquidator,
+                mint: coll_mint,
+                token_program: withdraw_tp,
+            },
+            EnsureAta {
+                payer: self.liquidator,
+                owner: self.liquidator,
+                mint: withdraw_liq_mint,
+                token_program: withdraw_tp,
+            },
+        ];
+        let mut out = Vec::new();
+        let mut seen = Vec::new();
+        for spec in specs {
+            let ata = spec.ata_address();
+            if seen.contains(&ata) {
+                continue;
+            }
+            if let Some(filter) = &self.missing_ata_filter {
+                if !filter.iter().any(|k| *k == ata) {
+                    continue;
+                }
+            }
+            seen.push(ata);
+            out.push(spec);
+        }
+        out
     }
 }
 
@@ -381,6 +439,7 @@ pub fn build_strategy_ixs(
                 flash: Some((borrow, repay)),
                 refresh_reserves: accounts.refresh_reserve_metas.clone(),
                 referrer_token_states: accounts.referrer_token_states.clone(),
+                ensure_atas: accounts.liquidator_ensure_atas(),
             };
             let labeled = build_flash_tx(&params, &swaps).unwrap_or_default();
             PlannedIxs {
@@ -417,6 +476,7 @@ pub fn build_strategy_ixs(
                 flash: None,
                 refresh_reserves: accounts.refresh_reserve_metas.clone(),
                 referrer_token_states: accounts.referrer_token_states.clone(),
+                ensure_atas: accounts.liquidator_ensure_atas(),
             };
             PlannedIxs {
                 labeled: build_inventory_tx(&params, &swaps),
@@ -591,5 +651,60 @@ mod tests {
             .labeled
             .iter()
             .any(|l| l.label == "FlashBorrowReserveLiquidity"));
+    }
+    #[test]
+    fn planner_emits_create_idempotent_before_flash_and_liquidate() {
+        let mut accounts = PlanAccountSet::from_seed(Pubkey::test(1, 1));
+        // Force known mints so CreateIdempotent is emitted (always when filter is None).
+        accounts.repay_liquidity_mint = Some(Pubkey::test(1, 100));
+        accounts.withdraw_collateral_mint = Some(Pubkey::test(1, 103));
+        accounts.withdraw_liquidity_mint = Some(Pubkey::test(1, 102));
+        accounts.repay_token_program = Some(programs::token());
+        accounts.withdraw_token_program = Some(programs::token());
+        let planned = build_strategy_ixs(
+            Protocol::Kamino,
+            FundingStrategy::KaminoFlashBorrow,
+            &accounts,
+            1_000_000,
+            &JupiterQuoteBlob::default(),
+        );
+        let labels: Vec<_> = planned.labeled.iter().map(|l| l.label.as_str()).collect();
+        let creates: Vec<_> = labels
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.contains("CreateIdempotent"))
+            .map(|(i, _)| i)
+            .collect();
+        assert!(!creates.is_empty(), "expected CreateIdempotent ixs: {labels:?}");
+        let borrow = labels
+            .iter()
+            .position(|l| *l == "flash_borrow_reserve_liquidity")
+            .unwrap();
+        let liq = labels
+            .iter()
+            .position(|l| l.contains("liquidate"))
+            .unwrap();
+        assert!(creates.iter().all(|c| *c < borrow));
+        assert!(borrow < liq);
+        // Encoding spot-check
+        let cix = &planned.labeled[creates[0]].ix;
+        assert_eq!(cix.program_id, programs::associated_token());
+        assert_eq!(cix.data, vec![1u8]);
+        assert_eq!(cix.accounts.len(), 6);
+    }
+
+    #[test]
+    fn missing_ata_filter_limits_create_idempotent() {
+        let mut accounts = PlanAccountSet::from_seed(Pubkey::test(2, 2));
+        accounts.repay_liquidity_mint = Some(Pubkey::test(2, 100));
+        accounts.withdraw_collateral_mint = Some(Pubkey::test(2, 103));
+        accounts.withdraw_liquidity_mint = Some(Pubkey::test(2, 102));
+        let all = accounts.liquidator_ensure_atas();
+        assert_eq!(all.len(), 3);
+        let only = all[1].ata_address();
+        accounts.missing_ata_filter = Some(vec![only]);
+        let filtered = accounts.liquidator_ensure_atas();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].ata_address(), only);
     }
 }

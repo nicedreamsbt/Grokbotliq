@@ -19,6 +19,33 @@ pub struct RefreshReserveAccounts {
     pub scope_prices: Pubkey,
 }
 
+/// Spec for Associated Token Program `CreateIdempotent` before flash/liquidate.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnsureAta {
+    pub payer: Pubkey,
+    pub owner: Pubkey,
+    pub mint: Pubkey,
+    pub token_program: Pubkey,
+}
+
+impl EnsureAta {
+    pub fn to_labeled_ix(&self) -> LabeledIx {
+        LabeledIx {
+            label: "CreateIdempotentAssociatedTokenAccount".into(),
+            ix: liq_core::create_associated_token_account_idempotent(
+                self.payer,
+                self.owner,
+                self.mint,
+                self.token_program,
+            ),
+        }
+    }
+
+    pub fn ata_address(&self) -> Pubkey {
+        liq_core::get_associated_token_address(&self.owner, &self.mint, &self.token_program)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KaminoTxBuildParams {
     pub obligation: Pubkey,
@@ -38,6 +65,25 @@ pub struct KaminoTxBuildParams {
     /// Order must match borrow_reserves. Empty when no referrer.
     #[serde(default)]
     pub referrer_token_states: Vec<Pubkey>,
+    /// CreateIdempotent ATAs inserted after refresh, before flash_borrow / liquidate.
+    /// Empty = skip. Duplicates by ATA address are collapsed.
+    #[serde(default)]
+    pub ensure_atas: Vec<EnsureAta>,
+}
+
+
+fn ensure_ata_ixs(params: &KaminoTxBuildParams) -> Vec<LabeledIx> {
+    let mut out = Vec::new();
+    let mut seen = Vec::new();
+    for spec in &params.ensure_atas {
+        let ata = spec.ata_address();
+        if seen.contains(&ata) {
+            continue;
+        }
+        seen.push(ata);
+        out.push(spec.to_labeled_ix());
+    }
+    out
 }
 
 fn refresh_ixs(params: &KaminoTxBuildParams) -> Vec<LabeledIx> {
@@ -174,12 +220,14 @@ pub fn build_inventory_tx(params: &KaminoTxBuildParams, swaps: &[LabeledIx]) -> 
         },
     ];
     ixs.extend(refresh_ixs(params));
+    // CreateIdempotent liquidator ATAs before liquidate (idempotent if already on-chain).
+    ixs.extend(ensure_ata_ixs(params));
     ixs.push(liquidate_ix(params));
     ixs.extend(swaps.iter().cloned());
     ixs
 }
 
-/// Flash path: CU → refresh → flash_borrow → liquidate_v2 → swaps → flash_repay.
+/// Flash path: CU → refresh → CreateIdempotent ATAs → flash_borrow → liquidate_v2 → swaps → flash_repay.
 pub fn build_flash_tx(params: &KaminoTxBuildParams, swaps: &[LabeledIx]) -> Option<Vec<LabeledIx>> {
     let (borrow_acc, repay_acc) = params.flash.as_ref()?;
     let mut ixs = vec![
@@ -193,6 +241,8 @@ pub fn build_flash_tx(params: &KaminoTxBuildParams, swaps: &[LabeledIx]) -> Opti
         },
     ];
     ixs.extend(refresh_ixs(params));
+    // CreateIdempotent before flash_borrow so borrow_instruction_index stays correct.
+    ixs.extend(ensure_ata_ixs(params));
     let borrow_idx = ixs.len() as u8;
     ixs.push(LabeledIx {
         label: "flash_borrow_reserve_liquidity".into(),
@@ -259,6 +309,7 @@ mod tests {
             flash: None,
             refresh_reserves: vec![],
             referrer_token_states: vec![],
+            ensure_atas: vec![],
         };
         let ixs = build_inventory_tx(&params, &[]);
         assert!(ixs.len() >= 5);
@@ -353,6 +404,7 @@ mod flash_builder_tests {
             flash: Some((b, r)),
             refresh_reserves: vec![],
             referrer_token_states: vec![],
+            ensure_atas: vec![],
         };
         let ixs = build_flash_tx(&params, &[]).expect("flash");
         let labels: Vec<_> = ixs.iter().map(|l| l.label.as_str()).collect();
@@ -362,5 +414,54 @@ mod flash_builder_tests {
         let ref_meta = &borrow.ix.accounts[8];
         assert_eq!(ref_meta.pubkey, programs::klend());
         assert!(!ref_meta.is_writable);
+    }
+    #[test]
+    fn create_atas_before_flash_borrow_and_borrow_index_accounts_for_them() {
+        let (b, r) = sample_flash();
+        let payer = Pubkey::test(3, 1);
+        let mint = Pubkey::test(1, 6);
+        let ensure = vec![EnsureAta {
+            payer,
+            owner: payer,
+            mint,
+            token_program: programs::token(),
+        }];
+        let params = KaminoTxBuildParams {
+            obligation: Pubkey::test(1, 2),
+            deposit_reserves: vec![Pubkey::test(1, 8)],
+            borrow_reserves: vec![Pubkey::test(1, 5)],
+            liquidate: sample_liq(),
+            liquidity_amount: 1_000,
+            min_acceptable_received: 0,
+            max_allowed_ltv_override_percent: 0,
+            cu_limit: 400_000,
+            cu_price: 1000,
+            flash: Some((b, r)),
+            refresh_reserves: vec![],
+            referrer_token_states: vec![],
+            ensure_atas: ensure,
+        };
+        let ixs = build_flash_tx(&params, &[]).expect("flash");
+        let labels: Vec<_> = ixs.iter().map(|l| l.label.as_str()).collect();
+        let create_pos = labels
+            .iter()
+            .position(|l| l.contains("CreateIdempotent"))
+            .expect("create ata");
+        let borrow_pos = labels
+            .iter()
+            .position(|l| *l == "flash_borrow_reserve_liquidity")
+            .unwrap();
+        let liq_pos = labels
+            .iter()
+            .position(|l| l.contains("liquidate"))
+            .unwrap();
+        assert!(create_pos < borrow_pos);
+        assert!(borrow_pos < liq_pos);
+        // flash_repay data ends with borrow_instruction_index == borrow_pos
+        let repay = ixs.iter().find(|l| l.label.contains("flash_repay")).unwrap();
+        assert_eq!(*repay.ix.data.last().unwrap(), borrow_pos as u8);
+        let create = &ixs[create_pos];
+        assert_eq!(create.ix.program_id, programs::associated_token());
+        assert_eq!(create.ix.data, vec![1u8]);
     }
 }

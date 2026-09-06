@@ -221,18 +221,22 @@ async fn run_mainnet_shadow() -> anyhow::Result<()> {
 
         match boot.simulate_transaction(&wire, false).await {
             Ok(sim) => {
-                let logs_trimmed: Vec<String> = sim
-                    .logs
-                    .iter()
-                    .take(24)
-                    .map(|l| {
-                        if l.len() > 240 {
-                            format!("{}…", &l[..240])
-                        } else {
-                            l.clone()
-                        }
-                    })
-                    .collect();
+                let trim = |l: &String| {
+                    if l.len() > 240 {
+                        format!("{}…", &l[..240])
+                    } else {
+                        l.clone()
+                    }
+                };
+                // Keep head + tail so CreateIdempotent and liquidate failure both visible.
+                let logs_trimmed: Vec<String> = if sim.logs.len() <= 28 {
+                    sim.logs.iter().map(trim).collect()
+                } else {
+                    let mut v: Vec<String> = sim.logs.iter().take(12).map(trim).collect();
+                    v.push("…".into());
+                    v.extend(sim.logs.iter().rev().take(14).collect::<Vec<_>>().into_iter().rev().map(trim));
+                    v
+                };
                 info!(
                     account = %cand.pubkey_short,
                     err = ?sim.err,
@@ -259,6 +263,7 @@ async fn run_mainnet_shadow() -> anyhow::Result<()> {
                     "strategy_vtx": true,
                     "note": vtx_note,
                     "account_notes": account_notes,
+                    "plan_ix_labels": built.labeled.iter().map(|l| l.label.clone()).collect::<Vec<_>>(),
                 }));
             }
             Err(e) => {
@@ -321,10 +326,9 @@ async fn run_mainnet_shadow() -> anyhow::Result<()> {
     gaps.push(format!(
         "shadow fee payer source={fee_payer_source}; SHADOW_FEE_PAYER is pubkey-only (never a private key)"
     ));
-    gaps.push(
-        "Kamino progress: past refresh_obligation (was ix4 Custom 6006 InvalidAccountInput) and flash_borrow; liquidate_v2 fails Custom 3012 AccountNotInitialized — sim fee payer lacks collateral/dest ATAs on-chain (createAta not in shadow tx)"
-            .into(),
-    );
+    // Progress note filled after sims when possible; keep a baseline gap marker.
+    let kamino_progress = summarize_kamino_sim_progress(&simulate_results);
+    gaps.push(kamino_progress);
 
         let report = json!({
         "mode": "mainnet_shadow",
@@ -575,6 +579,69 @@ async fn run_fixture_shadow(fixtures_arg: Option<String>) -> anyhow::Result<()> 
 }
 
 
+
+fn summarize_kamino_sim_progress(simulate_results: &[serde_json::Value]) -> String {
+    let mut best = "Kamino shadow: no strategy sims".to_string();
+    for s in simulate_results {
+        if s.get("protocol").and_then(|p| p.as_str()) != Some("Kamino") {
+            continue;
+        }
+        let ok = s.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+        let units = s
+            .get("units_consumed")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let err = s.get("err").cloned().unwrap_or(serde_json::Value::Null);
+        let logs = s
+            .get("logs_trimmed")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let labels_hint = s
+            .get("account_notes")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str())
+                    .filter(|t| t.contains("CreateIdempotent") || t.contains("liquidator_atas") || t.contains("missing"))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            })
+            .unwrap_or_default();
+        if ok {
+            return format!(
+                "Kamino progress: strategy vtx sim SUCCEEDED (units={units}); CreateIdempotent path cleared AccountNotInitialized"
+            );
+        }
+        // Prefer concrete InstructionError
+        let err_s = err.to_string();
+        let past_3012 = !err_s.contains("3012");
+        let create_seen = logs.iter().any(|l| {
+            l.as_str()
+                .map(|t| t.contains("CreateIdempotent") || t.contains("Associated Token"))
+                .unwrap_or(false)
+        });
+        best = format!(
+            "Kamino progress: CreateIdempotent ATAs before flash/liquidate (seen_in_logs={create_seen}); sim err={err_s}; units={units}; notes={labels_hint}"
+        );
+        if past_3012 {
+            let named = if err_s.contains("6009") {
+                "Custom 6009 ReserveStale (reserve needs refresh — often post-flash_borrow before liquidate)"
+            } else if err_s.contains("6017") {
+                "Custom 6017 ObligationStale"
+            } else if err_s.contains("6016") {
+                "Custom 6016 ObligationHealthy"
+            } else {
+                "see err"
+            };
+            return format!(
+                "Kamino progress: past liquidate AccountNotInitialized (3012); next={named}; raw={err_s}; units={units}"
+            );
+        }
+    }
+    best
+}
+
 async fn resolve_shadow_fee_payer<T: liq_streaming::JsonRpcTransport>(
     boot: &JsonRpcBootstrap<T>,
 ) -> anyhow::Result<(liq_core::Pubkey, String, &'static str)> {
@@ -787,10 +854,14 @@ async fn build_plan_accounts_for_candidate<T: liq_streaming::JsonRpcTransport>(
     ));
     notes.push("PlanAccountSet from live Klend positions+reserves (ATA+farm+referrer wiring)".into());
     // Prefetch liquidator ATAs + referrer token states (existence noted; no secrets).
-    let mut prefetch = vec![accounts.user_liquidity, accounts.user_collateral];
+    // Missing liquidator ATAs → CreateIdempotent in planner before flash/liquidate.
+    let mut ata_keys = vec![accounts.user_liquidity, accounts.user_collateral];
     if let Some(d) = accounts.user_destination_liquidity {
-        prefetch.push(d);
+        if !ata_keys.contains(&d) {
+            ata_keys.push(d);
+        }
     }
+    let mut prefetch = ata_keys.clone();
     prefetch.extend(accounts.referrer_token_states.iter().copied());
     match boot.get_multiple_accounts(&prefetch).await {
         Ok(fetched) => {
@@ -800,8 +871,26 @@ async fn build_plan_accounts_for_candidate<T: liq_streaming::JsonRpcTransport>(
                 present,
                 prefetch.len()
             ));
+            let mut missing = Vec::new();
+            for (i, key) in ata_keys.iter().enumerate() {
+                let exists = fetched.get(i).and_then(|a| a.as_ref()).is_some();
+                if !exists {
+                    missing.push(*key);
+                }
+            }
+            notes.push(format!(
+                "liquidator_atas missing={}/{} (CreateIdempotent will run for missing)",
+                missing.len(),
+                ata_keys.len()
+            ));
+            // Always CreateIdempotent is fine; filter to missing saves CU when some exist.
+            accounts.missing_ata_filter = Some(missing);
         }
-        Err(e) => notes.push(format!("prefetch ATA/referrer: {e}")),
+        Err(e) => {
+            notes.push(format!("prefetch ATA/referrer: {e}"));
+            // Fall back to creating all liquidator ATAs (idempotent).
+            accounts.missing_ata_filter = None;
+        }
     }
     (accounts, notes)
 }

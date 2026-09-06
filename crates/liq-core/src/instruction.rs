@@ -123,6 +123,47 @@ pub mod programs {
     }
 }
 
+/// SPL Associated Token Account: CreateIdempotent (ix tag = 1).
+///
+/// Account metas (Associated Token Program layout):
+/// 0. `[writable, signer]` funding payer
+/// 1. `[writable]` associated token account (PDA)
+/// 2. `[]` wallet owner
+/// 3. `[]` mint
+/// 4. `[]` system program
+/// 5. `[]` token program (Tokenkeg or Token-2022)
+///
+/// Data: single byte `1`. Safe to include even when the ATA already exists.
+pub fn create_associated_token_account_idempotent(
+    payer: Pubkey,
+    owner: Pubkey,
+    mint: Pubkey,
+    token_program: Pubkey,
+) -> Instruction {
+    let ata = crate::pda::get_associated_token_address(&owner, &mint, &token_program);
+    Instruction::new(
+        programs::associated_token(),
+        vec![
+            AccountMeta::new(payer, true),
+            AccountMeta::new(ata, false),
+            AccountMeta::new_readonly(owner, false),
+            AccountMeta::new_readonly(mint, false),
+            AccountMeta::new_readonly(programs::system(), false),
+            AccountMeta::new_readonly(token_program, false),
+        ],
+        vec![1u8],
+    )
+}
+
+/// Map mint account owner → SPL token program id (Tokenkeg vs Token-2022).
+pub fn token_program_from_mint_owner(mint_owner: &Pubkey) -> Pubkey {
+    if *mint_owner == programs::token_2022() {
+        programs::token_2022()
+    } else {
+        programs::token()
+    }
+}
+
 /// ComputeBudget: SetComputeUnitLimit (tag 2) + units le u32.
 pub fn compute_unit_limit(units: u32) -> Instruction {
     let mut data = vec![2u8];
@@ -157,5 +198,42 @@ mod tests {
         assert_ne!(programs::marginfi().0, [0u8; 32]);
         assert_ne!(programs::associated_token().0, [0u8; 32]);
         assert_ne!(programs::kfarms().0, [0u8; 32]);
+    }
+
+    #[test]
+    fn create_idempotent_encoding_and_metas() {
+        let payer = Pubkey::test(9, 1);
+        let owner = Pubkey::from_base58("5pHk2TmnqQzRF9L6egy5FfiyBgS7G9cMZ5RFaJAvghzw").unwrap();
+        let mint = Pubkey::from_base58("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v").unwrap();
+        let ix = create_associated_token_account_idempotent(payer, owner, mint, programs::token());
+        assert_eq!(ix.program_id, programs::associated_token());
+        assert_eq!(ix.data, vec![1u8]);
+        assert_eq!(ix.accounts.len(), 6);
+        assert!(ix.accounts[0].is_signer && ix.accounts[0].is_writable);
+        assert_eq!(ix.accounts[0].pubkey, payer);
+        assert!(ix.accounts[1].is_writable && !ix.accounts[1].is_signer);
+        // ATA PDA must match get_associated_token_address
+        let expected_ata = crate::pda::get_associated_token_address(&owner, &mint, &programs::token());
+        assert_eq!(ix.accounts[1].pubkey, expected_ata);
+        assert_eq!(ix.accounts[2].pubkey, owner);
+        assert_eq!(ix.accounts[3].pubkey, mint);
+        assert_eq!(ix.accounts[4].pubkey, programs::system());
+        assert_eq!(ix.accounts[5].pubkey, programs::token());
+    }
+
+    #[test]
+    fn token_program_from_mint_owner_detects_2022() {
+        assert_eq!(
+            token_program_from_mint_owner(&programs::token_2022()),
+            programs::token_2022()
+        );
+        assert_eq!(
+            token_program_from_mint_owner(&programs::token()),
+            programs::token()
+        );
+        assert_eq!(
+            token_program_from_mint_owner(&Pubkey::test(1, 1)),
+            programs::token()
+        );
     }
 }
