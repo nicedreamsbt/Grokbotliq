@@ -9,6 +9,7 @@ pub mod oracle_path;
 pub mod profitability;
 pub mod state_store;
 pub mod types;
+pub mod pda;
 
 pub use candidate_index::*;
 pub use funding::*;
@@ -18,3 +19,4 @@ pub use oracle_path::*;
 pub use profitability::*;
 pub use state_store::*;
 pub use types::*;
+pub use pda::*;

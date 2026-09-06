@@ -34,6 +34,10 @@ pub struct KaminoTxBuildParams {
     /// When present, refresh_reserve/obligation use full account metas.
     #[serde(default)]
     pub refresh_reserves: Vec<RefreshReserveAccounts>,
+    /// ReferrerTokenState PDAs for each borrow reserve when obligation has a referrer.
+    /// Order must match borrow_reserves. Empty when no referrer.
+    #[serde(default)]
+    pub referrer_token_states: Vec<Pubkey>,
 }
 
 fn refresh_ixs(params: &KaminoTxBuildParams) -> Vec<LabeledIx> {
@@ -98,12 +102,28 @@ fn refresh_ixs(params: &KaminoTxBuildParams) -> Vec<LabeledIx> {
             });
         }
     }
+    // refresh_obligation remaining accounts (klend handler):
+    //   deposits (slot order) + borrows (slot order)
+    //   [+ ReferrerTokenState per borrow when has_referrer]
+    // Count mismatch → Custom 6006 InvalidAccountInput.
     let mut obl_metas = vec![
         AccountMeta::new_readonly(market, false),
         AccountMeta::new(params.obligation, false),
     ];
-    for r in &seen {
+    // Exact deposit then borrow order — no dedup (count must match active_*_count).
+    let mut pushed = 0usize;
+    for r in params.deposit_reserves.iter().chain(params.borrow_reserves.iter()) {
         obl_metas.push(AccountMeta::new(*r, false));
+        pushed += 1;
+    }
+    // Fallback if deposit/borrow lists empty but we refreshed something.
+    if pushed == 0 {
+        for r in &seen {
+            obl_metas.push(AccountMeta::new(*r, false));
+        }
+    }
+    for rts in &params.referrer_token_states {
+        obl_metas.push(AccountMeta::new(*rts, false));
     }
     out.push(LabeledIx {
         label: "refresh_obligation".into(),
@@ -238,6 +258,7 @@ mod tests {
             cu_price: 1000,
             flash: None,
             refresh_reserves: vec![],
+            referrer_token_states: vec![],
         };
         let ixs = build_inventory_tx(&params, &[]);
         assert!(ixs.len() >= 5);
@@ -331,6 +352,7 @@ mod flash_builder_tests {
             cu_price: 1000,
             flash: Some((b, r)),
             refresh_reserves: vec![],
+            referrer_token_states: vec![],
         };
         let ixs = build_flash_tx(&params, &[]).expect("flash");
         let labels: Vec<_> = ixs.iter().map(|l| l.label.as_str()).collect();

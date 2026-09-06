@@ -24,9 +24,9 @@ pub mod known {
         // Well-known high-lamport system account (Binance 2 cold — public address only)
         "5tzFkiKscXHK5ZXCGbXZxdw7gTjjD1mBwuoFbhUvuAi9",
     ];
-    /// Klend main market authority PDA (seeds b"lma"+market, bump 255).
+    /// Klend main market authority PDA (seeds b"lma"+market, bump 248).
     pub const KLEND_MAIN_MARKET_AUTHORITY: &str =
-        "BWk2q2cei3KnkE51qmo51BZrcvxL9GnvTc7EYfhRmSn8";
+        "9DrvZvyWh1HuAoZxvYWMvkf2XCzryCpGgHqrMjyDWpmo";
     /// Save / Solend classic Obligation account sizes observed / documented.
     pub const SAVE_OBLIGATION_DATASIZES: &[u64] = &[1300, 916, 1192];
     /// Save lending market pubkey offset inside Obligation (classic layout).

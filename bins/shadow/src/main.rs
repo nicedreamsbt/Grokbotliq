@@ -322,7 +322,7 @@ async fn run_mainnet_shadow() -> anyhow::Result<()> {
         "shadow fee payer source={fee_payer_source}; SHADOW_FEE_PAYER is pubkey-only (never a private key)"
     ));
     gaps.push(
-        "Kamino strategy vtx reaches live RefreshReserve (oracle prices in logs); later ixs still fail (InvalidAccountInput / missing liquidator ATAs, farms placeholders) — expected until full ATA+farm wiring"
+        "Kamino progress: past refresh_obligation (was ix4 Custom 6006 InvalidAccountInput) and flash_borrow; liquidate_v2 fails Custom 3012 AccountNotInitialized — sim fee payer lacks collateral/dest ATAs on-chain (createAta not in shadow tx)"
             .into(),
     );
 
@@ -743,8 +743,7 @@ async fn build_plan_accounts_for_candidate<T: liq_streaming::JsonRpcTransport>(
         liq_streaming::short_b58(&withdraw_v.collateral_mint.to_base58()),
         vaults.len()
     ));
-    let market_auth = liq_core::Pubkey::from_base58(known::KLEND_MAIN_MARKET_AUTHORITY)
-        .unwrap_or_else(|| liq_core::Pubkey::test(0xBB, 1));
+    let market_auth = liq_kamino::lending_market_authority(&positions.header.lending_market);
     let mut accounts = PlanAccountSet::from_kamino_live(
         obl_pk,
         *fee_payer,
@@ -753,19 +752,57 @@ async fn build_plan_accounts_for_candidate<T: liq_streaming::JsonRpcTransport>(
         withdraw_v,
         market_auth,
     );
-    // Overlay full refresh metas for every fetched reserve.
-    accounts.refresh_reserve_metas = vaults
-        .values()
-        .map(|r| liq_kamino::RefreshReserveAccounts {
+    // Overlay full refresh metas: deposits then borrows (matches refresh_obligation remaining).
+    let mut refresh = Vec::new();
+    let mut seen_r = Vec::new();
+    for key in positions.deposits.iter().map(|d| d.reserve)
+        .chain(positions.borrows.iter().map(|b| b.reserve))
+    {
+        if seen_r.contains(&key) {
+            continue;
+        }
+        let Some(r) = vaults.get(&key) else { continue };
+        seen_r.push(key);
+        refresh.push(liq_kamino::RefreshReserveAccounts {
             reserve: r.address,
             lending_market: r.lending_market,
             pyth_oracle: r.pyth_oracle,
             switchboard_price: r.switchboard_price,
             switchboard_twap: r.switchboard_twap,
             scope_prices: r.scope_prices,
-        })
-        .collect();
-    notes.push("PlanAccountSet from live Klend positions+reserves".into());
+        });
+    }
+    accounts.refresh_reserve_metas = refresh;
+    if let Some(ref_pk) = accounts.referrer {
+        notes.push(format!(
+            "referrer={} referrer_token_states={}",
+            liq_streaming::short_b58(&ref_pk.to_base58()),
+            accounts.referrer_token_states.len()
+        ));
+    }
+    notes.push(format!(
+        "ATAs liq={} coll={}",
+        liq_streaming::short_b58(&accounts.user_liquidity.to_base58()),
+        liq_streaming::short_b58(&accounts.user_collateral.to_base58())
+    ));
+    notes.push("PlanAccountSet from live Klend positions+reserves (ATA+farm+referrer wiring)".into());
+    // Prefetch liquidator ATAs + referrer token states (existence noted; no secrets).
+    let mut prefetch = vec![accounts.user_liquidity, accounts.user_collateral];
+    if let Some(d) = accounts.user_destination_liquidity {
+        prefetch.push(d);
+    }
+    prefetch.extend(accounts.referrer_token_states.iter().copied());
+    match boot.get_multiple_accounts(&prefetch).await {
+        Ok(fetched) => {
+            let present = fetched.iter().flatten().count();
+            notes.push(format!(
+                "prefetched_ata_referrer_accounts present={}/{}",
+                present,
+                prefetch.len()
+            ));
+        }
+        Err(e) => notes.push(format!("prefetch ATA/referrer: {e}")),
+    }
     (accounts, notes)
 }
 

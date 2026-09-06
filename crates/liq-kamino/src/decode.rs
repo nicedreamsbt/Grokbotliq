@@ -144,10 +144,14 @@ pub struct LiveObligationHeader {
     pub allowed_borrow_value_sf: u128,
     pub unhealthy_borrow_value_sf: u128,
     pub has_debt: bool,
+    /// Referrer wallet; default pubkey means no referrer.
+    pub referrer: Pubkey,
 }
 
 /// Account data length for a full Obligation including Anchor discriminator.
 pub const LIVE_OBLIGATION_DATASIZE: usize = 3344;
+/// `referrer` pubkey offset (incl. disc) — after hasDebt @ 2287.
+pub const LIVE_REFERRER_OFFSET: usize = 2288;
 
 pub fn decode_obligation_live_header(
     address: Pubkey,
@@ -164,6 +168,12 @@ pub fn decode_obligation_live_header(
     let allowed_borrow_value_sf = u128::from_le_bytes(data[2240..2256].try_into().unwrap());
     let unhealthy_borrow_value_sf = u128::from_le_bytes(data[2256..2272].try_into().unwrap());
     let has_debt = data[2287] != 0;
+    let referrer = if data.len() >= LIVE_REFERRER_OFFSET + 32 {
+        Pubkey::from_bytes(&data[LIVE_REFERRER_OFFSET..LIVE_REFERRER_OFFSET + 32])
+            .ok_or(DecodeError::TooShort)?
+    } else {
+        Pubkey::default()
+    };
     Ok(LiveObligationHeader {
         address,
         lending_market,
@@ -173,6 +183,7 @@ pub fn decode_obligation_live_header(
         allowed_borrow_value_sf,
         unhealthy_borrow_value_sf,
         has_debt,
+        referrer,
     })
 }
 
@@ -181,6 +192,11 @@ pub fn live_obligation_is_liquidatable(h: &LiveObligationHeader) -> bool {
     h.has_debt
         && h.borrowed_assets_market_value_sf > 0
         && h.borrowed_assets_market_value_sf > h.unhealthy_borrow_value_sf
+}
+
+/// True when obligation.referrer is a non-default pubkey (klend has_referrer).
+pub fn live_obligation_has_referrer(h: &LiveObligationHeader) -> bool {
+    h.referrer.0 != [0u8; 32]
 }
 
 #[cfg(test)]
@@ -431,8 +447,14 @@ pub fn decode_reserve_live_vaults(
     })
 }
 
-/// Documented main-market authority PDA (seeds: b"lma" + market), bump 255.
-pub const KLEND_MAIN_MARKET_AUTHORITY: &str = "BWk2q2cei3KnkE51qmo51BZrcvxL9GnvTc7EYfhRmSn8";
+/// Documented main-market authority PDA (seeds: b"lma" + market), bump 248.
+/// PDA `["lma", main_market]` under Klend — verified via find_program_address.
+pub const KLEND_MAIN_MARKET_AUTHORITY: &str = "9DrvZvyWh1HuAoZxvYWMvkf2XCzryCpGgHqrMjyDWpmo";
+
+/// Derive lending market authority PDA: seeds `b"lma" + market` under Klend.
+pub fn lending_market_authority(market: &Pubkey) -> Pubkey {
+    liq_core::find_program_address(&[b"lma", market.0.as_ref()], &liq_core::programs::klend()).0
+}
 
 #[cfg(test)]
 mod live_position_tests {
@@ -501,6 +523,8 @@ mod live_position_tests {
 
     #[test]
     fn main_market_authority_decodes() {
-        assert!(Pubkey::from_base58(KLEND_MAIN_MARKET_AUTHORITY).is_some());
+        let pk = Pubkey::from_base58(KLEND_MAIN_MARKET_AUTHORITY).unwrap();
+        let market = Pubkey::from_base58("7u3HeHxYDLhnCoErrtycNokbQYbWGzLs6JSDqGAv5PfF").unwrap();
+        assert_eq!(lending_market_authority(&market), pk);
     }
 }

@@ -32,6 +32,7 @@ Discriminator smoke tests live in `liq-kamino`, `liq-project0`, and `liq-save` u
 Sources: Kamino-Finance/klend README; kamino.com program-addresses.
 
 Documented main market (mainnet): `7u3HeHxYDLhnCoErrtycNokbQYbWGzLs6JSDqGAv5PfF` (kamino.com market-data / SDK default).
+Market authority PDA `["lma", market]`: `9DrvZvyWh1HuAoZxvYWMvkf2XCzryCpGgHqrMjyDWpmo` (bump 248).
 
 ### Math / ordering
 
@@ -125,6 +126,12 @@ Args: borrow `{ liquidityAmount: u64 }`; repay `{ liquidityAmount: u64, borrowIn
 **Optional referrer metas:** When `referrerTokenState` / `referrerAccount` absent, official codegen uses **KLend program ID as readonly** — not lending_market as a writable placeholder. Implemented in `liq-kamino::flash`.
 
 `KAMINO_FLASH_SUPPORTED = true`; inventory + post-liq swap remains available if flash is disabled at runtime.
+
+**refresh_obligation remaining accounts:** deposits (slot order) + borrows (slot order) [+ `ReferrerTokenState` PDA per borrow when `obligation.referrer ≠ default`]. Count mismatch → **Custom 6006 `InvalidAccountInput`**. Referrer PDA seeds: `["referrer_acc", referrer, reserve]`.
+
+**liquidate_v2 farm placeholders:** official klend-sdk codegen uses **KLend program ID readonly** when optional farm accounts are absent (not the Farms program id). `farmsProgram` meta remains `FarmsPZp…`.
+
+**Shadow liquidator ATAs:** derived via Associated Token Program (`[owner, token_program, mint]`) for `SHADOW_FEE_PAYER` / sim fee payer — no private key.
 
 ### Project 0 receivership (flash alternative)
 

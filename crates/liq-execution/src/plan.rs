@@ -45,6 +45,17 @@ pub struct PlanAccountSet {
     pub from_live_decode: bool,
     /// Live refresh_reserve metas (market + oracles) when decoded.
     pub refresh_reserve_metas: Vec<RefreshReserveAccounts>,
+    /// Optional destination liquidity ATA (withdraw liquidity mint) — defaults to user_liquidity.
+    pub user_destination_liquidity: Option<Pubkey>,
+    /// Farm accounts from reserves (None → KLend program id placeholder in liquidate_v2).
+    pub collateral_obligation_farm_user_state: Option<Pubkey>,
+    pub collateral_reserve_farm_state: Option<Pubkey>,
+    pub debt_obligation_farm_user_state: Option<Pubkey>,
+    pub debt_reserve_farm_state: Option<Pubkey>,
+    /// Obligation referrer wallet when non-default.
+    pub referrer: Option<Pubkey>,
+    /// ReferrerTokenState PDAs aligned with borrow_reserves_extra (when referrer set).
+    pub referrer_token_states: Vec<Pubkey>,
 }
 
 impl PlanAccountSet {
@@ -76,6 +87,13 @@ impl PlanAccountSet {
             borrow_reserves_extra: vec![],
             from_live_decode: false,
             refresh_reserve_metas: vec![],
+            user_destination_liquidity: None,
+            collateral_obligation_farm_user_state: None,
+            collateral_reserve_farm_state: None,
+            debt_obligation_farm_user_state: None,
+            debt_reserve_farm_state: None,
+            referrer: None,
+            referrer_token_states: vec![],
         }
     }
 
@@ -90,6 +108,44 @@ impl PlanAccountSet {
     ) -> Self {
         let deposit_reserves_extra: Vec<_> = positions.deposits.iter().map(|d| d.reserve).collect();
         let borrow_reserves_extra: Vec<_> = positions.borrows.iter().map(|b| b.reserve).collect();
+        // Real ATAs for fee payer / liquidator (derivation only — no private key).
+        let repay_tp = if repay.token_program.0 == [0u8; 32] {
+            programs::token()
+        } else {
+            repay.token_program
+        };
+        let withdraw_tp = if withdraw.token_program.0 == [0u8; 32] {
+            programs::token()
+        } else {
+            withdraw.token_program
+        };
+        let user_liquidity = liq_core::get_associated_token_address(
+            &liquidator,
+            &repay.liquidity_mint,
+            &repay_tp,
+        );
+        let user_collateral = liq_core::get_associated_token_address(
+            &liquidator,
+            &withdraw.collateral_mint,
+            &withdraw_tp,
+        );
+        let user_dest_liq = liq_core::get_associated_token_address(
+            &liquidator,
+            &withdraw.liquidity_mint,
+            &withdraw_tp,
+        );
+        let nonzero = |pk: Pubkey| (pk.0 != [0u8; 32]).then_some(pk);
+        let referrer = nonzero(positions.header.referrer);
+        let referrer_token_states = if let Some(ref_pk) = referrer {
+            borrow_reserves_extra
+                .iter()
+                .map(|r| liq_core::klend_referrer_token_state(&ref_pk, r))
+                .collect()
+        } else {
+            vec![]
+        };
+        // Farm reserve states from live reserve decode; obligation farm user
+        // states left None → KLend program id readonly placeholder (sdk pattern).
         Self {
             liquidator,
             obligation,
@@ -97,9 +153,8 @@ impl PlanAccountSet {
             lending_market_authority: market_authority,
             repay_reserve: repay.address,
             withdraw_reserve: withdraw.address,
-            // User ATAs unknown in unsigned shadow — placeholders (sim will fail on token accounts).
-            user_liquidity: Pubkey::test(0xFE, 1),
-            user_collateral: Pubkey::test(0xFE, 2),
+            user_liquidity,
+            user_collateral,
             repay_liquidity_mint: Some(repay.liquidity_mint),
             repay_liquidity_supply: Some(repay.liquidity_supply),
             repay_fee_receiver: Some(repay.fee_vault),
@@ -108,14 +163,20 @@ impl PlanAccountSet {
             withdraw_collateral_supply: Some(withdraw.collateral_supply),
             withdraw_liquidity_supply: Some(withdraw.liquidity_supply),
             withdraw_fee_receiver: Some(withdraw.fee_vault),
-            repay_token_program: Some(repay.token_program),
-            withdraw_token_program: Some(withdraw.token_program),
+            repay_token_program: Some(repay_tp),
+            withdraw_token_program: Some(withdraw_tp),
             deposit_reserves_extra,
             borrow_reserves_extra,
             from_live_decode: true,
             refresh_reserve_metas: {
+                // Deposit then borrow order for stable refresh_ix sequencing.
                 let mut v = Vec::new();
-                for r in [repay, withdraw] {
+                let mut seen = Vec::new();
+                for r in [withdraw, repay] {
+                    if seen.contains(&r.address) {
+                        continue;
+                    }
+                    seen.push(r.address);
                     v.push(RefreshReserveAccounts {
                         reserve: r.address,
                         lending_market: r.lending_market,
@@ -127,6 +188,15 @@ impl PlanAccountSet {
                 }
                 v
             },
+            user_destination_liquidity: Some(user_dest_liq),
+            // Unused farms: both sides None → KLend program id readonly (sdk codegen).
+            // Do not pass reserve farm_state alone without obligation farm user state.
+            collateral_obligation_farm_user_state: None,
+            collateral_reserve_farm_state: None,
+            debt_obligation_farm_user_state: None,
+            debt_reserve_farm_state: None,
+            referrer,
+            referrer_token_states,
         }
     }
 }
@@ -159,17 +229,18 @@ fn kamino_liquidate_accounts(a: &PlanAccountSet) -> LiquidateV2Accounts {
             .unwrap_or_else(|| Pubkey::test(a.withdraw_reserve.0[0], 106)),
         user_source_liquidity: a.user_liquidity,
         user_destination_collateral: a.user_collateral,
-        user_destination_liquidity: a.user_liquidity,
+        user_destination_liquidity: a
+            .user_destination_liquidity
+            .unwrap_or(a.user_liquidity),
         collateral_token_program: a.withdraw_token_program.unwrap_or_else(programs::token),
         repay_liquidity_token_program: a.repay_token_program.unwrap_or_else(programs::token),
         withdraw_liquidity_token_program: a.withdraw_token_program.unwrap_or_else(programs::token),
         instruction_sysvar_account: programs::sysvar_instructions(),
-        collateral_obligation_farm_user_state: None,
-        collateral_reserve_farm_state: None,
-        debt_obligation_farm_user_state: None,
-        debt_reserve_farm_state: None,
-        farms_program: Pubkey::from_base58("FarmsPZpWu9i7Kky8tPN37rs2TpmMrAZrC7S7vJa91Hr")
-            .unwrap_or_else(|| Pubkey::test(90, 1)),
+        collateral_obligation_farm_user_state: a.collateral_obligation_farm_user_state,
+        collateral_reserve_farm_state: a.collateral_reserve_farm_state,
+        debt_obligation_farm_user_state: a.debt_obligation_farm_user_state,
+        debt_reserve_farm_state: a.debt_reserve_farm_state,
+        farms_program: programs::kfarms(),
         deposit_reserves: a.deposit_reserves_extra.clone(),
     }
 }
@@ -271,22 +342,32 @@ pub fn build_strategy_ixs(
     match (protocol, strategy) {
         (Protocol::Kamino, FundingStrategy::KaminoFlashBorrow) => {
             let (borrow, repay) = kamino_flash_pair(accounts);
-            let mut deposit_reserves = if accounts.deposit_reserves_extra.is_empty() {
-                vec![accounts.withdraw_reserve]
+            // Live decode: exact active deposit/borrow lists (count-sensitive for
+            // refresh_obligation Custom 6006). Fixture path may pad with repay/withdraw.
+            let (deposit_reserves, borrow_reserves) = if accounts.from_live_decode {
+                (
+                    accounts.deposit_reserves_extra.clone(),
+                    accounts.borrow_reserves_extra.clone(),
+                )
             } else {
-                accounts.deposit_reserves_extra.clone()
+                let mut deposit_reserves = if accounts.deposit_reserves_extra.is_empty() {
+                    vec![accounts.withdraw_reserve]
+                } else {
+                    accounts.deposit_reserves_extra.clone()
+                };
+                let mut borrow_reserves = if accounts.borrow_reserves_extra.is_empty() {
+                    vec![accounts.repay_reserve]
+                } else {
+                    accounts.borrow_reserves_extra.clone()
+                };
+                if !deposit_reserves.contains(&accounts.withdraw_reserve) {
+                    deposit_reserves.push(accounts.withdraw_reserve);
+                }
+                if !borrow_reserves.contains(&accounts.repay_reserve) {
+                    borrow_reserves.push(accounts.repay_reserve);
+                }
+                (deposit_reserves, borrow_reserves)
             };
-            let mut borrow_reserves = if accounts.borrow_reserves_extra.is_empty() {
-                vec![accounts.repay_reserve]
-            } else {
-                accounts.borrow_reserves_extra.clone()
-            };
-            if !deposit_reserves.contains(&accounts.withdraw_reserve) {
-                deposit_reserves.push(accounts.withdraw_reserve);
-            }
-            if !borrow_reserves.contains(&accounts.repay_reserve) {
-                borrow_reserves.push(accounts.repay_reserve);
-            }
             let params = KaminoTxBuildParams {
                 obligation: accounts.obligation,
                 deposit_reserves,
@@ -299,6 +380,7 @@ pub fn build_strategy_ixs(
                 cu_price: 1_000,
                 flash: Some((borrow, repay)),
                 refresh_reserves: accounts.refresh_reserve_metas.clone(),
+                referrer_token_states: accounts.referrer_token_states.clone(),
             };
             let labeled = build_flash_tx(&params, &swaps).unwrap_or_default();
             PlannedIxs {
@@ -308,12 +390,16 @@ pub fn build_strategy_ixs(
             }
         }
         (Protocol::Kamino, FundingStrategy::Inventory) => {
-            let deposit_reserves = if accounts.deposit_reserves_extra.is_empty() {
+            let deposit_reserves = if accounts.from_live_decode {
+                accounts.deposit_reserves_extra.clone()
+            } else if accounts.deposit_reserves_extra.is_empty() {
                 vec![accounts.withdraw_reserve]
             } else {
                 accounts.deposit_reserves_extra.clone()
             };
-            let borrow_reserves = if accounts.borrow_reserves_extra.is_empty() {
+            let borrow_reserves = if accounts.from_live_decode {
+                accounts.borrow_reserves_extra.clone()
+            } else if accounts.borrow_reserves_extra.is_empty() {
                 vec![accounts.repay_reserve]
             } else {
                 accounts.borrow_reserves_extra.clone()
@@ -330,6 +416,7 @@ pub fn build_strategy_ixs(
                 cu_price: 1_000,
                 flash: None,
                 refresh_reserves: accounts.refresh_reserve_metas.clone(),
+                referrer_token_states: accounts.referrer_token_states.clone(),
             };
             PlannedIxs {
                 labeled: build_inventory_tx(&params, &swaps),
@@ -458,6 +545,35 @@ mod tests {
             .labeled
             .iter()
             .any(|l| l.label.contains("flash_borrow")));
+    }
+
+    #[test]
+    fn ata_derivation_for_liquidator_is_deterministic() {
+        let owner = Pubkey::from_base58("5pHk2TmnqQzRF9L6egy5FfiyBgS7G9cMZ5RFaJAvghzw").unwrap();
+        let mint = Pubkey::from_base58("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v").unwrap();
+        let a = liq_core::get_associated_token_address_token(&owner, &mint);
+        let b = liq_core::get_associated_token_address(&owner, &mint, &programs::token());
+        assert_eq!(a, b);
+        assert_ne!(a, owner);
+    }
+
+    #[test]
+    fn farm_placeholder_metas_use_klend_not_farms_program() {
+        let accounts = PlanAccountSet::from_seed(Pubkey::test(9, 9));
+        let liq = super::kamino_liquidate_accounts(&accounts);
+        let metas = liq.metas();
+        for name in [
+            "collateral_obligation_farm_user_state",
+            "collateral_reserve_farm_state",
+            "debt_obligation_farm_user_state",
+            "debt_reserve_farm_state",
+        ] {
+            let m = metas.iter().find(|x| x.name == name).unwrap();
+            assert_eq!(m.key, programs::klend());
+            assert_ne!(m.key, programs::kfarms());
+        }
+        let fp = metas.iter().find(|x| x.name == "farms_program").unwrap();
+        assert_eq!(fp.key, programs::kfarms());
     }
 
     #[test]

@@ -52,7 +52,9 @@ pub struct LiquidateV2Accounts {
 
 impl LiquidateV2Accounts {
     pub fn metas(&self) -> Vec<AccountMetaDesc> {
-        let placeholder = self.farms_program;
+        // Official klend-sdk codegen uses **KLend program id** (not farms) as
+        // readonly placeholder when optional farm accounts are absent.
+        let placeholder = liq_core::programs::klend();
         let mut v = vec![
             AccountMetaDesc { name: "liquidator", key: self.liquidator, role: MetaRole::Signer },
             AccountMetaDesc { name: "obligation", key: self.obligation, role: MetaRole::Writable },
@@ -201,5 +203,24 @@ mod tests {
     fn v2_meta_count_without_farms() {
         // 20 liquidation + 4 farm placeholders + farmsProgram + 1 deposit = 26
         assert_eq!(sample().metas().len(), 26);
+    }
+
+    #[test]
+    fn farm_placeholder_uses_klend_program_id_not_farms() {
+        let metas = sample().metas();
+        // indices: 20..24 = farm placeholders, 24 = farms_program
+        let farms_prog = metas.iter().find(|m| m.name == "farms_program").unwrap();
+        assert_eq!(farms_prog.key, Pubkey::test(1, 21));
+        for name in [
+            "collateral_obligation_farm_user_state",
+            "collateral_reserve_farm_state",
+            "debt_obligation_farm_user_state",
+            "debt_reserve_farm_state",
+        ] {
+            let m = metas.iter().find(|x| x.name == name).unwrap();
+            assert_eq!(m.key, liq_core::programs::klend(), "{name}");
+            assert_eq!(m.role, MetaRole::Readonly);
+            assert_ne!(m.key, farms_prog.key);
+        }
     }
 }

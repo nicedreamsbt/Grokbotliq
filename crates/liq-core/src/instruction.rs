@@ -100,6 +100,21 @@ pub mod programs {
         ])
     }
 
+
+    pub fn associated_token() -> Pubkey {
+        // ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL
+        Pubkey::from_base58("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL").unwrap_or_else(Pubkey::default)
+    }
+
+    pub fn token_2022() -> Pubkey {
+        // TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb
+        Pubkey::from_base58("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb").unwrap_or_else(Pubkey::default)
+    }
+
+    pub fn kfarms() -> Pubkey {
+        // FarmsPZpWu9i7Kky8tPN37rs2TpmMrAZrC7S7vJa91Hr
+        Pubkey::from_base58("FarmsPZpWu9i7Kky8tPN37rs2TpmMrAZrC7S7vJa91Hr").unwrap_or_else(Pubkey::default)
+    }
     pub fn marginfi() -> Pubkey {
         Pubkey::new([
             5, 48, 122, 214, 69, 75, 188, 94, 30, 78, 146, 5, 146, 83, 161, 139, 184, 200, 134,
@@ -140,5 +155,7 @@ mod tests {
         assert_ne!(programs::klend().0, [0u8; 32]);
         assert_ne!(programs::save().0, [0u8; 32]);
         assert_ne!(programs::marginfi().0, [0u8; 32]);
+        assert_ne!(programs::associated_token().0, [0u8; 32]);
+        assert_ne!(programs::kfarms().0, [0u8; 32]);
     }
 }
