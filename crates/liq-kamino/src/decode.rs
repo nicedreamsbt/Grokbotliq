@@ -126,6 +126,63 @@ pub fn encode_obligation_planning(obl: &KaminoObligation) -> Vec<u8> {
     d
 }
 
+/// Live mainnet Obligation header (IDL offsets; discriminator included at 0).
+///
+/// Offsets from klend IDL account layout (+8 disc):
+/// - lending_market @ 32
+/// - deposited_value_sf @ 1192
+/// - borrowed_assets_market_value_sf @ 2224
+/// - unhealthy_borrow_value_sf @ 2256
+/// - has_debt @ 2287
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveObligationHeader {
+    pub address: Pubkey,
+    pub lending_market: Pubkey,
+    pub owner: Pubkey,
+    pub deposited_value_sf: u128,
+    pub borrowed_assets_market_value_sf: u128,
+    pub allowed_borrow_value_sf: u128,
+    pub unhealthy_borrow_value_sf: u128,
+    pub has_debt: bool,
+}
+
+/// Account data length for a full Obligation including Anchor discriminator.
+pub const LIVE_OBLIGATION_DATASIZE: usize = 3344;
+
+pub fn decode_obligation_live_header(
+    address: Pubkey,
+    data: &[u8],
+) -> Result<LiveObligationHeader, DecodeError> {
+    if data.len() < 2288 {
+        return Err(DecodeError::TooShort);
+    }
+    let lending_market = Pubkey::from_bytes(&data[32..64]).ok_or(DecodeError::TooShort)?;
+    let owner = Pubkey::from_bytes(&data[64..96]).ok_or(DecodeError::TooShort)?;
+    let deposited_value_sf = u128::from_le_bytes(data[1192..1208].try_into().unwrap());
+    let borrowed_assets_market_value_sf =
+        u128::from_le_bytes(data[2224..2240].try_into().unwrap());
+    let allowed_borrow_value_sf = u128::from_le_bytes(data[2240..2256].try_into().unwrap());
+    let unhealthy_borrow_value_sf = u128::from_le_bytes(data[2256..2272].try_into().unwrap());
+    let has_debt = data[2287] != 0;
+    Ok(LiveObligationHeader {
+        address,
+        lending_market,
+        owner,
+        deposited_value_sf,
+        borrowed_assets_market_value_sf,
+        allowed_borrow_value_sf,
+        unhealthy_borrow_value_sf,
+        has_debt,
+    })
+}
+
+/// True when on-chain SF values indicate liquidatable (borrowed > unhealthy threshold).
+pub fn live_obligation_is_liquidatable(h: &LiveObligationHeader) -> bool {
+    h.has_debt
+        && h.borrowed_assets_market_value_sf > 0
+        && h.borrowed_assets_market_value_sf > h.unhealthy_borrow_value_sf
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -165,5 +222,23 @@ mod tests {
         };
         let (hf, _, _) = obligation_health(&decoded, &prices).unwrap();
         assert!(hf.to_f64() > 1.0);
+    }
+
+    #[test]
+    fn live_header_offsets_roundtrip_synthetic() {
+        let mut data = vec![0u8; LIVE_OBLIGATION_DATASIZE];
+        let market = Pubkey::test(11, 1);
+        let owner = Pubkey::test(11, 2);
+        data[32..64].copy_from_slice(&market.0);
+        data[64..96].copy_from_slice(&owner.0);
+        let borrowed: u128 = 200;
+        let unhealthy: u128 = 100;
+        data[2224..2240].copy_from_slice(&borrowed.to_le_bytes());
+        data[2256..2272].copy_from_slice(&unhealthy.to_le_bytes());
+        data[2287] = 1;
+        let h = decode_obligation_live_header(Pubkey::test(11, 3), &data).unwrap();
+        assert_eq!(h.lending_market, market);
+        assert_eq!(h.owner, owner);
+        assert!(live_obligation_is_liquidatable(&h));
     }
 }

@@ -1,10 +1,10 @@
-//! Shadow mode: process fixtures / mock stream, evaluate opportunities, never sign/broadcast.
-//! Asserts DRY_RUN is enabled.
+//! Shadow mode: fixtures or `--mainnet` / `LIQ_MAINNET_SHADOW=1`.
+//! Asserts DRY_RUN; never sendTransaction / Jito.
 
 use anyhow::{bail, ensure, Context};
 use liq_core::{
-    CandidateIndex, FundingStrategy, OracleTriggerPath, PriceFx, ProfitConfig, ProfitDecision,
-    ProfitInput, ProfitabilityCalculator, Protocol, TriggerHit, UpdateSource,
+    CandidateIndex, FundingStrategy, OracleTriggerPath, PriceFx, ProfitConfig,
+    ProfitDecision, ProfitInput, ProfitabilityCalculator, Protocol, TriggerHit, UpdateSource,
 };
 use liq_execution::{
     build_strategy_ixs, BidProfile, ExecConfig, ExecutionEngine, PlanAccountSet, PreparedTx,
@@ -12,13 +12,16 @@ use liq_execution::{
 use liq_risk::{CircuitBreaker, RiskLimits};
 use liq_routing::JupiterQuoteBlob;
 use liq_streaming::{
-    borrower_to_meta, borrower_triggers, drain_all, load_borrowers, load_oracle_ticks,
-    resolve_fixtures_dir, rpc_url_configured, shadow_tx_base64, ticks_to_events, BorrowerFixture,
-    FixtureBootstrap, HttpJsonRpcTransport, JsonRpcBootstrap, MockGeyser, RpcBootstrap,
-    StreamEvent, YellowstoneConfig,
+    borrower_to_meta, borrower_triggers, discover_mainnet, drain_all, load_borrowers,
+    load_local_env_files, load_oracle_ticks, pool_from_env, resolve_fixtures_dir,
+    rpc_url_configured, rpc_urls_from_env, shadow_tx_base64, ticks_to_events, BorrowerFixture,
+    FixtureBootstrap, HttpJsonRpcTransport, JsonRpcBootstrap, MockGeyser,
+    known, minimal_cu_limit_tx_base64_with_payer, RpcBootstrap, StreamEvent,
+    YellowstoneConfig,
 };
 use liq_telemetry::Metrics;
 use serde::Serialize;
+use serde_json::json;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -73,15 +76,236 @@ fn env_dry_run() -> bool {
         .unwrap_or(true)
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
-        )
-        .init();
+fn wants_mainnet(args: &[String]) -> bool {
+    args.iter().any(|a| a == "--mainnet")
+        || std::env::var("LIQ_MAINNET_SHADOW")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+}
 
+async fn run_mainnet_shadow() -> anyhow::Result<()> {
+    let loaded = load_local_env_files(None);
+    for (path, keys) in &loaded {
+        info!(path = %path.display(), keys = ?keys, "loaded local env (values not logged)");
+    }
+    ensure!(env_dry_run(), "shadow refuses DRY_RUN=false");
+
+    let urls = rpc_urls_from_env();
+    ensure!(
+        !urls.is_empty() && urls.iter().any(|u| rpc_url_configured(u)),
+        "mainnet shadow needs RPC_URLS or RPC_URL in config/local.env"
+    );
+    let pool = pool_from_env().context("rpc pool")?;
+    info!(
+        hosts = ?pool.stats_snapshot().iter().map(|s| &s.host).collect::<Vec<_>>(),
+        "rotating RPC pool ready"
+    );
+
+    let discovery = discover_mainnet(&pool).await.context("discover_mainnet")?;
+    info!(
+        slot = discovery.slot,
+        host = %discovery.endpoint_host,
+        scanned = discovery.accounts_scanned,
+        candidates = discovery.candidates.len(),
+        "discovery complete"
+    );
+
+    let metrics = Arc::new(Metrics::new());
+    let risk = Arc::new(CircuitBreaker::new(RiskLimits::default(), metrics.clone()));
+    let exec = ExecutionEngine::new(
+        ExecConfig {
+            dry_run: true,
+            rpc_url: pool.current_host(), // host-only placeholder; never used for broadcast in dry_run
+            jito_block_engine_url: None,
+            bid_profile: BidProfile::Conservative,
+        },
+        risk,
+        metrics.clone(),
+    );
+    ensure!(exec.config.dry_run, "internal: dry_run");
+
+    let boot = JsonRpcBootstrap::new(pool.clone());
+    let mut simulate_results = Vec::new();
+
+    // Pick a real mainnet account as simulate fee-payer (sigVerify=false — never signed).
+    let mut sim_payer = [1u8; 32];
+    let mut sim_payer_short = "synthetic".to_string();
+    for cand in known::SIM_FEE_PAYER_CANDIDATES {
+        if let Some(pk) = liq_core::Pubkey::from_base58(cand) {
+            match boot.get_account_info(&pk).await {
+                Ok(Some(a)) if a.lamports > 0 => {
+                    sim_payer = a.pubkey.0;
+                    sim_payer_short = liq_streaming::short_b58(cand);
+                    info!(payer = %sim_payer_short, lamports = a.lamports, "simulate fee-payer selected");
+                    break;
+                }
+                _ => continue,
+            }
+        }
+    }
+
+
+    // Prefer CRITICAL/HOT candidates from discovery; else simulate a synthetic plan proving RPC path.
+    let hot: Vec<_> = discovery
+        .candidates
+        .iter()
+        .filter(|c| {
+            matches!(c.band.as_deref(), Some("CRITICAL") | Some("HOT"))
+                || c.health.map(|h| h < 1.0).unwrap_or(false)
+        })
+        .cloned()
+        .collect();
+
+    let mut planned = 0usize;
+    for cand in hot.iter().take(3) {
+        let protocol = match cand.protocol.as_str() {
+            "Kamino" => Protocol::Kamino,
+            "Project0" => Protocol::Project0,
+            "Save" => Protocol::Save,
+            _ => continue,
+        };
+        let strategy = match protocol {
+            Protocol::Kamino => FundingStrategy::KaminoFlashBorrow,
+            Protocol::Save => FundingStrategy::SaveFlashLoan,
+            Protocol::Project0 => FundingStrategy::Project0Receivership,
+        };
+        // Seed accounts from candidate short key bytes are unavailable — use deterministic seed.
+        let seed = liq_core::Pubkey::test(0xA5, planned as u64);
+        let accounts = PlanAccountSet::from_seed(seed);
+        let built = build_strategy_ixs(
+            protocol,
+            strategy,
+            &accounts,
+            1_000_000,
+            &JupiterQuoteBlob::from_env(),
+        );
+        let wire_ixs: Vec<_> = built.labeled.iter().map(|l| l.ix.clone()).collect();
+        let planned_ixs_count = wire_ixs.len();
+        let envelope = shadow_tx_base64(&wire_ixs, "11111111111111111111111111111111");
+        let tx = PreparedTx {
+            label: format!("mainnet-shadow-{}", cand.pubkey_short),
+            protocol: cand.protocol.clone(),
+            account: cand.pubkey_short.clone(),
+            notional_usd_micro: 1_000_000,
+            expected_profit_usd_micro: 0,
+            wire: envelope.clone().into_bytes(),
+            instructions: wire_ixs,
+            funding_strategy: Some(strategy.as_str().to_string()),
+            ixs: built.labeled.iter().map(|l| l.label.clone()).collect(),
+        };
+        let res = exec.execute(&tx, 0).await?;
+        ensure!(res.dry_run && res.signature.is_none());
+        planned += 1;
+
+        // Plan builders emit Instruction lists; live RPC needs VersionedTransaction wire.
+        // Simulate a minimal valid CU-limit vtx (sigVerify=false) as proof-of-RPC until signing is wired.
+        let wire = minimal_cu_limit_tx_base64_with_payer(200_000, &sim_payer);
+        let _ = envelope; // strategy envelope retained in PreparedTx path above (dry-run only)
+        match boot.simulate_transaction(&wire, false).await {
+            Ok(sim) => {
+                info!(
+                    account = %cand.pubkey_short,
+                    err = ?sim.err,
+                    units = ?sim.units_consumed,
+                    plan_ixs = planned_ixs_count,
+                    "simulateTransaction minimal vtx (sigVerify=false)"
+                );
+                simulate_results.push(json!({
+                    "account": cand.pubkey_short,
+                    "protocol": cand.protocol,
+                    "rpc_ok": true,
+                    "ok": sim.err.is_none(),
+                    "err": sim.err,
+                    "units_consumed": sim.units_consumed,
+                    "log_count": sim.logs.len(),
+                    "plan_ix_count": planned_ixs_count,
+                    "fee_payer": sim_payer_short,
+                    "note": "simulated minimal CU vtx; strategy plan not yet VersionedTransaction-encoded",
+                }));
+            }
+            Err(e) => {
+                warn!(error = %e, "simulate failed");
+                simulate_results.push(json!({
+                    "account": cand.pubkey_short,
+                    "protocol": cand.protocol,
+                    "rpc_ok": false,
+                    "ok": false,
+                    "error": e.to_string(),
+                    "plan_ix_count": planned_ixs_count,
+                }));
+            }
+        }
+    }
+
+    if planned == 0 {
+        let wire = minimal_cu_limit_tx_base64_with_payer(200_000, &sim_payer);
+        match boot.simulate_transaction(&wire, false).await {
+            Ok(sim) => {
+                info!(
+                    err = ?sim.err,
+                    units = ?sim.units_consumed,
+                    "zero-candidate prove simulate (sigVerify=false)"
+                );
+                simulate_results.push(json!({
+                    "account": null,
+                    "protocol": "prove",
+                    "rpc_ok": true,
+                    "ok": sim.err.is_none(),
+                    "err": sim.err,
+                    "units_consumed": sim.units_consumed,
+                    "fee_payer": sim_payer_short,
+                    "note": "no HOT/CRITICAL candidates; simulated minimal CU vtx",
+                }));
+            }
+            Err(e) => {
+                simulate_results.push(json!({
+                    "account": null,
+                    "protocol": "prove",
+                    "rpc_ok": false,
+                    "ok": false,
+                    "error": e.to_string(),
+                }));
+            }
+        }
+    }
+
+    let report = json!({
+        "mode": "mainnet_shadow",
+        "dry_run": true,
+        "broadcast": false,
+        "slot": discovery.slot,
+        "rpc_health": discovery.health,
+        "endpoint_host": discovery.endpoint_host,
+        "endpoint_stats": discovery.endpoint_stats,
+        "accounts_scanned": discovery.accounts_scanned,
+        "by_protocol": discovery.by_protocol,
+        "known_markets": discovery.known_markets,
+        "program_ids": discovery.program_ids,
+        "candidates": discovery.candidates,
+        "candidates_hot_critical": hot.len(),
+        "plans_built": planned,
+        "simulate_results": simulate_results,
+        "gaps": discovery.gaps,
+    });
+
+    let out = PathBuf::from("artifacts/shadow-report.json");
+    if let Some(parent) = out.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&out, serde_json::to_vec_pretty(&report)?)?;
+    info!(path = %out.display(), "wrote redacted shadow report");
+
+    // Sanity: report must not contain api-key query strings.
+    let raw = std::fs::read_to_string(&out)?;
+    ensure!(
+        !raw.to_lowercase().contains("api-key="),
+        "refusing to leave api-key material in shadow report"
+    );
+
+    Ok(())
+}
+
+async fn run_fixture_shadow(fixtures_arg: Option<String>) -> anyhow::Result<()> {
     let dry = env_dry_run();
     ensure!(
         dry,
@@ -93,12 +317,10 @@ async fn main() -> anyhow::Result<()> {
         warn!(
             endpoint = %cfg.endpoint,
             has_token = cfg.has_credentials(),
-            "GEYSER configured but shadow uses fixtures/mock only (no live subscribe)"
+            "GEYSER configured but fixture shadow uses fixtures/mock only"
         );
     }
 
-    let mut args = std::env::args().skip(1);
-    let fixtures_arg = args.next();
     let dir = resolve_fixtures_dir(fixtures_arg.as_deref());
     let ticks_path = PathBuf::from(&dir).join("oracle_ticks.json");
     let borrowers_path = PathBuf::from(&dir).join("borrowers.json");
@@ -121,7 +343,7 @@ async fn main() -> anyhow::Result<()> {
     let risk = Arc::new(CircuitBreaker::new(RiskLimits::default(), metrics.clone()));
     let exec = ExecutionEngine::new(
         ExecConfig {
-            dry_run: true, // hard-forced
+            dry_run: true,
             rpc_url: std::env::var("RPC_URL").unwrap_or_else(|_| "https://YOUR_PRIVATE_RPC".into()),
             jito_block_engine_url: None,
             bid_profile: BidProfile::Conservative,
@@ -259,20 +481,24 @@ async fn main() -> anyhow::Result<()> {
                         detail = %res.detail,
                         "shadow dry-run only (no broadcast)"
                     );
-                    // Simulate when RPC configured; fixtures always simulate locally.
-                    let rpc = std::env::var("RPC_URL").unwrap_or_else(|_| "https://YOUR_PRIVATE_RPC".into());
+                    let rpc =
+                        std::env::var("RPC_URL").unwrap_or_else(|_| "https://YOUR_PRIVATE_RPC".into());
                     if rpc_url_configured(&rpc) {
                         if let Ok(transport) = HttpJsonRpcTransport::new(&rpc) {
                             let boot = JsonRpcBootstrap::new(transport);
                             match boot.simulate_transaction(&envelope, false).await {
-                                Ok(sim) => info!(err=?sim.err, units=?sim.units_consumed, "shadow simulateTransaction"),
-                                Err(e) => info!(error=%e, "shadow simulate skipped"),
+                                Ok(sim) => info!(
+                                    err = ?sim.err,
+                                    units = ?sim.units_consumed,
+                                    "shadow simulateTransaction"
+                                ),
+                                Err(e) => info!(error = %e, "shadow simulate skipped"),
                             }
                         }
                     } else {
                         let boot = FixtureBootstrap::demo_for_protocols();
                         let sim = boot.simulate_transaction(&envelope, false).await?;
-                        info!(logs=?sim.logs, "shadow fixture simulate (sigVerify=false, no broadcast)");
+                        info!(logs = ?sim.logs, "shadow fixture simulate (sigVerify=false, no broadcast)");
                     }
                 }
             }
@@ -287,4 +513,22 @@ async fn main() -> anyhow::Result<()> {
         "shadow complete (no broadcast)"
     );
     Ok(())
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info".into()),
+        )
+        .init();
+
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if wants_mainnet(&args) {
+        run_mainnet_shadow().await
+    } else {
+        let fixtures_arg = args.into_iter().find(|a| !a.starts_with("--"));
+        run_fixture_shadow(fixtures_arg).await
+    }
 }

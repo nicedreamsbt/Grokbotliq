@@ -31,6 +31,8 @@ Discriminator smoke tests live in `liq-kamino`, `liq-project0`, and `liq-save` u
 
 Sources: Kamino-Finance/klend README; kamino.com program-addresses.
 
+Documented main market (mainnet): `7u3HeHxYDLhnCoErrtycNokbQYbWGzLs6JSDqGAv5PfF` (kamino.com market-data / SDK default).
+
 ### Math / ordering
 
 - Liquidatable when borrowed > sum(deposit * liq_threshold)
@@ -55,6 +57,8 @@ Sources: Kamino-Finance/klend README; kamino.com program-addresses.
 
 Sources: docs.0.xyz program-addresses; `0dotxyz/marginfi-v2`.
 
+Main group (mainnet): `4qp6Fx6tnZkY5Wropq9wUYgtFxXKwE6viZxFHg3rdAG8` (docs.marginfi.com).
+
 - Maint health < 0 ⇒ liquidatable
 - Classic ~2.5% + 2.5%; receivership start/end; max fee ~10% (`FeeState`)
 - Seeds: `feestate`, `liq_record`
@@ -69,6 +73,7 @@ Sources: docs.0.xyz program-addresses; `0dotxyz/marginfi-v2`.
 - Order: RefreshReserve* → RefreshObligation → LiquidateObligationAndRedeemReserveCollateral
 - Upgrade authority: `2Fwvr3MKhHhqakgjjEWcpWZZabbRCetHjukHi1zfKxjk`
 - Market owner: `5pHk2TmnqQzRF9L6egy5FfiyBgS7G9cMZ5RFaJAvghzw`
+- Main lending market (classic pool): `4UpD2fh7xH3VP9QQaXtsS1YY3bxzWhtfpks7FatyKvdY`
 - Fee receiver: `9RuqAN42PTUi9ya59k9suGATrkqzvb9gk2QABJtQzGP5`
 - SLND mint: `SLNDpmoWTVADgEdndyvWzroNL7zSi1dF9PC3xHGtPwp`
 
@@ -132,9 +137,11 @@ Wire builders in `liq-project0::tx_builder` emit real `Instruction` lists (progr
 ## 4. Streaming / Yellowstone / RPC
 
 - Trait + mock + **multi-provider freshness failover** in `liq-streaming`
-- **HTTP JSON-RPC (reqwest)** `HttpJsonRpcTransport` + `JsonRpcBootstrap`: `getAccountInfo`, `getMultipleAccounts`, `getProgramAccounts`, `simulateTransaction` (config `rpc_url` / `RPC_URL`; fails clearly on placeholder)
+- **HTTP JSON-RPC (reqwest)** `HttpJsonRpcTransport` + `JsonRpcBootstrap`: `getSlot`, `getHealth`, `getAccountInfo`, `getMultipleAccounts`, filtered `getProgramAccounts`, `simulateTransaction`
+- **`RotatingRpcPool`**: `RPC_URLS` / `RPC_URL` from gitignored `config/local.env`; rotate on 429/5xx/timeout; host-only telemetry
+- **Mainnet discovery**: known Klend market / marginfi group / Save market + filtered GPA; Klend live SF header decode
 - Yellowstone: stub retained; **prefer working RPC bootstrap** over half-broken gRPC until yellowstone-grpc is linked
-- Env: `GEYSER_ENDPOINT`, `GEYSER_X_TOKEN`, optional `GEYSER_COMMITMENT`, `GEYSER_PING_MS`; `LIQ_FIXTURES` for offline CI
+- Env: `GEYSER_ENDPOINT`, `GEYSER_X_TOKEN`, optional `GEYSER_COMMITMENT`, `GEYSER_PING_MS`; `LIQ_FIXTURES` for offline CI; `LIQ_MAINNET_SHADOW=1`
 
 ## 5. Needs live credentials (still)
 

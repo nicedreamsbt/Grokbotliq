@@ -14,3 +14,6 @@ keys/
 .secrets/
 *.log
 .DS_Store
+config/local.env
+artifacts/
+!.gitkeep

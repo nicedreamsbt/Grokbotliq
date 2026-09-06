@@ -13,10 +13,11 @@ use liq_execution::{
 use liq_risk::{CircuitBreaker, RiskLimits};
 use liq_routing::{RouteCache, StubRouter};
 use liq_streaming::{
-    apply_account_update, apply_raw_to_store, borrower_to_meta, borrower_triggers, load_borrowers,
-    load_oracle_ticks, resolve_fixtures_dir, rpc_url_configured, shadow_tx_base64, ticks_to_events,
-    FixtureBootstrap, GeyserSubscriber, HttpJsonRpcTransport, JsonRpcBootstrap, MockGeyser,
-    RpcBootstrap, StreamEvent, SubscribeFilter, YellowstoneConfig, YellowstoneSubscriber,
+    apply_account_update, apply_raw_to_store, borrower_to_meta, borrower_triggers, discover_mainnet,
+    load_borrowers, load_local_env_files, load_oracle_ticks, pool_from_env, resolve_fixtures_dir,
+    rpc_url_configured, rpc_urls_from_env, shadow_tx_base64, ticks_to_events, FixtureBootstrap,
+    GeyserSubscriber, HttpJsonRpcTransport, JsonRpcBootstrap, MockGeyser, RpcBootstrap,
+    StreamEvent, SubscribeFilter, YellowstoneConfig, YellowstoneSubscriber,
 };
 use liq_routing::JupiterQuoteBlob;
 use liq_telemetry::Metrics;
@@ -61,6 +62,7 @@ fn load_config() -> AppConfig {
     }
 }
 
+#[allow(dead_code)]
 fn use_fixtures() -> bool {
     std::env::var("LIQ_FIXTURES").is_ok()
         || PathBuf::from("fixtures/oracle_ticks.json").exists()
@@ -76,14 +78,23 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
+    for (path, keys) in load_local_env_files(None) {
+        info!(path = %path.display(), keys = ?keys, "loaded local env (values not logged)");
+    }
+
     let cfg = load_config();
     let dry = std::env::var("DRY_RUN")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(cfg.dry_run);
 
+    let rpc_log = std::env::var("RPC_URL")
+        .ok()
+        .filter(|u| rpc_url_configured(u))
+        .map(|u| liq_streaming::rpc_url_host_only(&u))
+        .unwrap_or_else(|| liq_streaming::rpc_url_host_only(&cfg.rpc_url));
     info!(
         dry_run = dry,
-        rpc = %cfg.rpc_url,
+        rpc_host = %rpc_log,
         geyser = ?cfg.geyser_endpoint,
         jito = ?cfg.jito_block_engine_url,
         "starting liquidator"
@@ -118,15 +129,17 @@ async fn main() -> anyhow::Result<()> {
 
     // --- State store + bootstrap ---
     let store: Arc<StateStore<Vec<u8>>> = Arc::new(StateStore::new());
-    let force_fixtures = std::env::var("LIQ_FIXTURES").is_ok() || use_fixtures();
-    let live_rpc = rpc_url_configured(&cfg.rpc_url)
-        && std::env::var("RPC_URL")
-            .map(|u| rpc_url_configured(&u))
-            .unwrap_or(rpc_url_configured(&cfg.rpc_url));
-    // Prefer LIQ_FIXTURES for CI; otherwise real RPC when url configured.
-    let rpc_url = std::env::var("RPC_URL").unwrap_or_else(|_| cfg.rpc_url.clone());
+    // LIQ_FIXTURES forces offline CI path; otherwise prefer live RPC_URL/RPC_URLS from local.env.
+    let force_fixtures = std::env::var("LIQ_FIXTURES").is_ok();
+    let env_urls = rpc_urls_from_env();
+    let live_configured = env_urls.iter().any(|u| rpc_url_configured(u))
+        || rpc_url_configured(&cfg.rpc_url);
+    let rpc_url = env_urls
+        .first()
+        .cloned()
+        .unwrap_or_else(|| cfg.rpc_url.clone());
 
-    if force_fixtures || !rpc_url_configured(&rpc_url) {
+    if force_fixtures || !live_configured {
         let boot = FixtureBootstrap::demo_for_protocols();
         for owner in [programs::klend(), programs::save(), programs::marginfi()] {
             let accts = boot
@@ -137,22 +150,48 @@ async fn main() -> anyhow::Result<()> {
         }
         info!(accounts = store.len(), "bootstrapped from fixtures (offline CI path)");
     } else {
-        match HttpJsonRpcTransport::new(&rpc_url) {
-            Ok(transport) => {
-                let boot = JsonRpcBootstrap::new(transport);
-                info!(%rpc_url, "live JSON-RPC bootstrap via reqwest");
-                for owner in [programs::klend(), programs::save(), programs::marginfi()] {
-                    match boot.get_program_accounts(&owner).await {
-                        Ok(accts) => {
-                            apply_raw_to_store(&store, &accts, UpdateSource::Rpc);
-                            info!(owner = %owner, n = accts.len(), "program accounts loaded");
+        let pool = pool_from_env().or_else(|_| liq_streaming::RotatingRpcPool::from_urls(vec![rpc_url.clone()]));
+        match pool {
+            Ok(pool) => {
+                info!(host = %pool.current_host(), n = pool.len(), "live rotating RPC bootstrap");
+                match discover_mainnet(&pool).await {
+                    Ok(rep) => {
+                        info!(
+                            slot = rep.slot,
+                            scanned = rep.accounts_scanned,
+                            candidates = rep.candidates.len(),
+                            host = %rep.endpoint_host,
+                            "mainnet discovery bootstrap (live over Pubkey::test demo)"
+                        );
+                        // Warm store with known market accounts (scoped, not full GPA dump).
+                        let boot = JsonRpcBootstrap::new(pool.clone());
+                        let keys: Vec<_> = [
+                            liq_streaming::known::KLEND_MAIN_MARKET,
+                            liq_streaming::known::MARGINFI_MAIN_GROUP,
+                            liq_streaming::known::SAVE_MAIN_MARKET,
+                        ]
+                        .iter()
+                        .filter_map(|s| liq_core::Pubkey::from_base58(s))
+                        .collect();
+                        if let Ok(accts) = boot.get_multiple_accounts(&keys).await {
+                            let raw: Vec<_> = accts.into_iter().flatten().collect();
+                            apply_raw_to_store(&store, &raw, UpdateSource::Rpc);
+                            info!(n = raw.len(), "known market/group accounts stored");
                         }
-                        Err(e) => warn!(error = %e, owner = %owner, "getProgramAccounts failed"),
+                        let _ = rep;
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "discover_mainnet failed — fixture fallback");
+                        let boot = FixtureBootstrap::demo_for_protocols();
+                        for owner in [programs::klend(), programs::save(), programs::marginfi()] {
+                            let accts = boot.get_program_accounts(&owner).await?;
+                            apply_raw_to_store(&store, &accts, UpdateSource::Rpc);
+                        }
                     }
                 }
             }
             Err(e) => {
-                warn!(error = %e, "RPC transport unavailable — falling back to fixtures");
+                warn!(error = %e, "RPC pool unavailable — falling back to fixtures");
                 let boot = FixtureBootstrap::demo_for_protocols();
                 for owner in [programs::klend(), programs::save(), programs::marginfi()] {
                     let accts = boot.get_program_accounts(&owner).await?;
@@ -161,7 +200,6 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     }
-    let _ = live_rpc;
 
     // Prefetch HOT route cache structure (empty quotes OK).
     route_cache.prefetch_hot(

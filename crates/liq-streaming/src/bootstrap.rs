@@ -167,14 +167,46 @@ pub fn jsonrpc_get_multiple_accounts(keys_b58: &[String], commitment: &str) -> V
 }
 
 pub fn jsonrpc_get_program_accounts(program_id: &str, commitment: &str) -> Value {
+    jsonrpc_get_program_accounts_filtered(program_id, commitment, &[])
+}
+
+/// `filters` are Solana RPC filter objects, e.g. `{"dataSize": 3344}` or
+/// `{"memcmp": {"offset": 32, "bytes": "<base58>"}}`.
+pub fn jsonrpc_get_program_accounts_filtered(
+    program_id: &str,
+    commitment: &str,
+    filters: &[Value],
+) -> Value {
+    let mut cfg = json!({
+        "encoding": "base64",
+        "commitment": commitment
+    });
+    if !filters.is_empty() {
+        cfg["filters"] = Value::Array(filters.to_vec());
+    }
     json!({
         "jsonrpc": "2.0",
         "id": 1,
         "method": "getProgramAccounts",
-        "params": [
-            program_id,
-            { "encoding": "base64", "commitment": commitment }
-        ]
+        "params": [program_id, cfg]
+    })
+}
+
+pub fn jsonrpc_get_slot(commitment: &str) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getSlot",
+        "params": [{ "commitment": commitment }]
+    })
+}
+
+pub fn jsonrpc_get_health() -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getHealth",
+        "params": []
     })
 }
 
@@ -275,7 +307,7 @@ pub struct HttpJsonRpcTransport {
 impl std::fmt::Debug for HttpJsonRpcTransport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HttpJsonRpcTransport")
-            .field("rpc_url", &self.rpc_url)
+            .field("rpc_url", &crate::redact::rpc_url_host_only(&self.rpc_url))
             .finish()
     }
 }
@@ -315,15 +347,26 @@ impl JsonRpcTransport for HttpJsonRpcTransport {
         let resp = self
             .client
             .post(&self.rpc_url)
+            .timeout(std::time::Duration::from_secs(25))
             .json(body)
             .send()
             .await
-            .map_err(|e| BootstrapError::Http(e.to_string()))?;
+            .map_err(|e| {
+                let msg = e.to_string();
+                if e.is_timeout() || msg.to_lowercase().contains("timed out") {
+                    BootstrapError::Http(format!("timeout: {msg}"))
+                } else {
+                    BootstrapError::Http(msg)
+                }
+            })?;
         let status = resp.status();
         let val: Value = resp
             .json()
             .await
             .map_err(|e| BootstrapError::Http(format!("json body ({status}): {e}")))?;
+        if status.as_u16() == 429 {
+            return Err(BootstrapError::Http(format!("HTTP 429: {val}")));
+        }
         if !status.is_success() {
             return Err(BootstrapError::Http(format!("HTTP {status}: {val}")));
         }
@@ -369,6 +412,66 @@ impl<T: JsonRpcTransport> JsonRpcBootstrap<T> {
             transport,
             commitment: "processed".into(),
         }
+    }
+
+    pub fn with_commitment(mut self, commitment: impl Into<String>) -> Self {
+        self.commitment = commitment.into();
+        self
+    }
+
+    pub async fn get_slot(&self) -> Result<u64, BootstrapError> {
+        let body = jsonrpc_get_slot(&self.commitment);
+        let resp = self.transport.post_json(&body).await?;
+        resp.get("result")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| BootstrapError::Decode("getSlot result".into()))
+    }
+
+    pub async fn get_health(&self) -> Result<String, BootstrapError> {
+        let body = jsonrpc_get_health();
+        let resp = self.transport.post_json(&body).await?;
+        match resp.get("result") {
+            Some(Value::String(s)) => Ok(s.clone()),
+            Some(v) => Ok(v.to_string()),
+            None => Err(BootstrapError::Decode("getHealth result".into())),
+        }
+    }
+
+    pub async fn get_program_accounts_filtered(
+        &self,
+        program_id: &Pubkey,
+        filters: &[Value],
+    ) -> Result<Vec<RawAccount>, BootstrapError> {
+        let body = jsonrpc_get_program_accounts_filtered(
+            &program_id.to_base58(),
+            &self.commitment,
+            filters,
+        );
+        let resp = self.transport.post_json(&body).await?;
+        let slot = result_slot(&resp);
+        // filtered GPA may return result as array OR {value: [...]} depending on provider
+        let arr = resp
+            .pointer("/result")
+            .and_then(|v| v.as_array())
+            .or_else(|| resp.pointer("/result/value").and_then(|v| v.as_array()))
+            .ok_or_else(|| BootstrapError::Decode("result array".into()))?;
+        let mut out = Vec::new();
+        for item in arr {
+            let pk_s = item
+                .get("pubkey")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| BootstrapError::Decode("pubkey".into()))?;
+            let pubkey = Pubkey::from_base58(pk_s).ok_or_else(|| {
+                BootstrapError::Decode(format!("bad pubkey {pk_s}"))
+            })?;
+            let account = item
+                .get("account")
+                .ok_or_else(|| BootstrapError::Decode("account".into()))?;
+            if let Some(raw) = parse_account_value(pubkey, slot, account)? {
+                out.push(raw);
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -492,6 +595,62 @@ pub fn apply_account_update(store: &StateStore<Vec<u8>>, update: &crate::Account
     ))
 }
 
+
+/// Compact-u16 (Solana shortvec) encode.
+fn shortvec_encode(n: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut v = n;
+    while v >= 0x80 {
+        out.push(((v & 0x7f) as u8) | 0x80);
+        v >>= 7;
+    }
+    out.push(v as u8);
+    out
+}
+
+/// Build a minimal unsigned legacy transaction (ComputeBudget::SetComputeUnitLimit only).
+/// Valid wire format for `simulateTransaction` with `sigVerify=false` + `replaceRecentBlockhash`.
+/// Fee-payer is the system program id placeholder (64 zero signature).
+pub fn minimal_cu_limit_tx_base64(units: u32) -> String {
+    minimal_cu_limit_tx_base64_with_payer(units, &[1u8; 32])
+}
+
+/// Same as [`minimal_cu_limit_tx_base64`] but with an explicit 32-byte fee-payer pubkey.
+/// Prefer a real system-owned mainnet account so simulate does not return AccountNotFound.
+pub fn minimal_cu_limit_tx_base64_with_payer(units: u32, fee_payer: &[u8; 32]) -> String {
+    use liq_core::programs;
+    let fee_payer = *fee_payer;
+    let cu_program = programs::compute_budget().0;
+    // Message header: 1 required sig, 0 readonly signed, 1 readonly unsigned (program)
+    let mut msg = Vec::new();
+    msg.push(1u8); // num_required_signatures
+    msg.push(0u8); // num_readonly_signed
+    msg.push(1u8); // num_readonly_unsigned
+    // account keys: fee_payer, compute_budget
+    msg.extend_from_slice(&shortvec_encode(2));
+    msg.extend_from_slice(&fee_payer);
+    msg.extend_from_slice(&cu_program);
+    // recent blockhash (zeros — replaced by RPC when replaceRecentBlockhash=true)
+    msg.extend_from_slice(&[0u8; 32]);
+    // instructions: one compiled ix
+    // program_id_index = 1, accounts empty, data = [2] + units le
+    let mut data = vec![2u8];
+    data.extend_from_slice(&units.to_le_bytes());
+    let mut ix = Vec::new();
+    ix.push(1u8); // program index
+    ix.extend_from_slice(&shortvec_encode(0)); // no accounts
+    ix.extend_from_slice(&shortvec_encode(data.len()));
+    ix.extend_from_slice(&data);
+    msg.extend_from_slice(&shortvec_encode(1));
+    msg.extend_from_slice(&ix);
+    // signatures: 1 x 64 zero bytes
+    let mut tx = Vec::new();
+    tx.extend_from_slice(&shortvec_encode(1));
+    tx.extend_from_slice(&[0u8; 64]);
+    tx.extend_from_slice(&msg);
+    base64::engine::general_purpose::STANDARD.encode(tx)
+}
+
 /// Serialize a list of instructions into a shadow payload for simulateTransaction.
 /// Not a full Solana VersionedTransaction — a portable JSON envelope the RPC mock
 /// accepts; live path base64-encodes this envelope until solana-sdk signing is wired.
@@ -537,9 +696,17 @@ mod tests {
         assert_eq!(v["method"], "getMultipleAccounts");
         let v2 = jsonrpc_get_program_accounts("Prog", "confirmed");
         assert_eq!(v2["method"], "getProgramAccounts");
+        let v2f = jsonrpc_get_program_accounts_filtered(
+            "Prog",
+            "confirmed",
+            &[json!({"dataSize": 3344})],
+        );
+        assert_eq!(v2f["params"][1]["filters"][0]["dataSize"], 3344);
         let v3 = jsonrpc_simulate_transaction("AQ==", false);
         assert_eq!(v3["method"], "simulateTransaction");
         assert_eq!(v3["params"][1]["sigVerify"], false);
+        assert_eq!(jsonrpc_get_slot("processed")["method"], "getSlot");
+        assert_eq!(jsonrpc_get_health()["method"], "getHealth");
     }
 
     #[test]
@@ -604,5 +771,13 @@ mod tests {
         assert!(!rpc_url_configured("https://YOUR_PRIVATE_RPC"));
         assert!(!rpc_url_configured(""));
         assert!(rpc_url_configured("https://api.mainnet-beta.solana.com"));
+    }
+
+    #[test]
+    fn minimal_cu_tx_is_small_wire() {
+        let b64 = minimal_cu_limit_tx_base64(200_000);
+        let raw = base64::engine::general_purpose::STANDARD.decode(&b64).unwrap();
+        assert!(raw.len() < 200, "len={}", raw.len());
+        assert!(raw.len() > 64);
     }
 }

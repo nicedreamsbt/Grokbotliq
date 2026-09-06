@@ -1,14 +1,23 @@
 //! Geyser subscriber trait, mock provider, multi-provider freshness failover,
-//! fixture loading, RPC bootstrap, and Yellowstone integration stubs (compile without live gRPC creds).
+//! fixture loading, rotating RPC pool, mainnet discovery, RPC bootstrap,
+//! and Yellowstone integration stubs (compile without live gRPC creds).
 
 mod bootstrap;
+mod discovery;
 mod failover;
 mod fixtures;
+mod local_env;
+mod redact;
+mod rpc_pool;
 mod yellowstone;
 
 pub use bootstrap::*;
+pub use discovery::*;
 pub use failover::*;
 pub use fixtures::*;
+pub use local_env::*;
+pub use redact::*;
+pub use rpc_pool::*;
 pub use yellowstone::*;
 
 use async_trait::async_trait;

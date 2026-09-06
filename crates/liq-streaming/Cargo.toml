@@ -6,6 +6,9 @@ license.workspace = true
 
 [dependencies]
 liq-core = { workspace = true }
+liq-kamino = { workspace = true }
+liq-project0 = { workspace = true }
+liq-save = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
