@@ -242,56 +242,25 @@ async fn main() -> anyhow::Result<()> {
         }]
     };
 
-    // TODO(StreamDetectionPath): When detection.rs / HotPathCache ingest seam merges,
-    // wire this receiver into StreamDetectionPath::ingest() instead of direct loop below.
-    // Current path: rx.recv() → apply_account_update(&store, &upd) → index/oracle_path
-    
-    let mut rx = if let Some(ys_cfg) = YellowstoneConfig::from_env() {
-        if ys_cfg.has_credentials() {
-            info!(
-                endpoint = %ys_cfg.endpoint,
-                "Yellowstone gRPC client enabled — attempting live subscribe with Klend filters"
-            );
-            let ys = YellowstoneSubscriber::new(ys_cfg);
-            
-            // Subscribe to Klend program accounts (obligations + reserves)
-            let klend_filter = SubscribeFilter {
-                owners: vec![programs::klend()],
-                accounts: vec![], // owner filter covers obligations/reserves via datasize
-            };
-            
-            match ys.subscribe(klend_filter).await {
-                Ok(rx) => {
-                    info!("Yellowstone live subscribe active — streaming Klend account updates");
-                    rx
-                }
-                Err(e) => {
-                    warn!(error = %e, "Yellowstone subscribe failed; falling back to mock/fixture stream");
-                    let mock = MockGeyser::named("liquidator-loop", events.clone());
-                    mock.subscribe(SubscribeFilter::default())
-                        .await
-                        .context("subscribe mock fallback")?
-                }
-            }
-        } else {
-            info!("GEYSER_X_TOKEN missing — using mock/fixture stream (DRY_RUN safe)");
-            let mock = MockGeyser::named("liquidator-loop", events.clone());
-            mock.subscribe(SubscribeFilter::default())
-                .await
-                .context("subscribe mock")?
+    if let Some(ys_cfg) = YellowstoneConfig::from_env() {
+        info!(
+            endpoint = %ys_cfg.endpoint,
+            has_token = ys_cfg.has_credentials(),
+            "Yellowstone config present — live subscribe still behind stub until gRPC client linked"
+        );
+        let ys = YellowstoneSubscriber::new(ys_cfg);
+        if let Err(e) = ys.subscribe(SubscribeFilter::default()).await {
+            info!(error = %e, "Yellowstone stub not live; continuing with mock/fixture stream");
         }
     } else if cfg.geyser_endpoint.is_some() {
         info!("geyser_endpoint in config but GEYSER_ENDPOINT env unset — using fixtures/mock");
-        let mock = MockGeyser::named("liquidator-loop", events.clone());
-        mock.subscribe(SubscribeFilter::default())
-            .await
-            .context("subscribe mock")?
-    } else {
-        let mock = MockGeyser::named("liquidator-loop", events.clone());
-        mock.subscribe(SubscribeFilter::default())
-            .await
-            .context("subscribe mock")?
-    };
+    }
+
+    let mock = MockGeyser::named("liquidator-loop", events.clone());
+    let mut rx = mock
+        .subscribe(SubscribeFilter::default())
+        .await
+        .context("subscribe mock")?;
 
     let max_ticks = std::env::var("LIQ_LOOP_TICKS")
         .ok()
